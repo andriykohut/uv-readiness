@@ -1,8 +1,14 @@
 """Check whether a uv project's locked dependencies are ready for a Python version."""
 
 import re
+import shutil
+import subprocess
+import tempfile
+import textwrap
+import tomllib
 from collections import defaultdict
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
 
@@ -15,6 +21,10 @@ Package = dict[str, Any]
 
 class SetupError(Exception):
     """The tool cannot run as asked; reported as exit code 2."""
+
+
+class RelockError(Exception):
+    """`uv lock` failed on the temporary copy; str() is uv's stderr or a short reason."""
 
 
 class Target(NamedTuple):
@@ -203,3 +213,70 @@ def classify(lock: Lock, target: Target, original: Lock | None = None) -> list[P
             status = "source-only"
         result.append(Pkg(name, version, status, sorted(parents)))
     return sorted(result, key=lambda p: (p.name, p.version or ""))
+
+
+# ponytail: regex edit of requires-python; a project that sets it another way loses the resolver pass
+REQUIRES_PYTHON = re.compile(r"""^(\s*requires-python\s*=\s*)(["']).*?\2""", re.MULTILINE)
+VERSION_LINE = re.compile(r"\s+[\w.\-]+\s?(==|>=|<=|>|<)\s?[\w.*+!]+")
+
+
+def _load(path: Path) -> Lock:
+    with path.open("rb") as file:
+        return tomllib.load(file)
+
+
+def _member_dirs(lock: Lock) -> set[Path]:
+    dirs = {Path(".")}
+    for root in _roots(lock):
+        source = root.get("source", {})
+        if path := source.get("editable") or source.get("virtual"):
+            dirs.add(Path(path))
+    return dirs
+
+
+def relock(project: Path, target: Target, *args: str) -> Lock:
+    """Run `uv lock *args` on a copy of the project pinned to the target Python."""
+    with tempfile.TemporaryDirectory(prefix="uv-readiness-") as tmp:
+        copy = Path(tmp)
+        narrowed = 0
+        for member in _member_dirs(_load(project / "uv.lock")):
+            if member.is_absolute() or ".." in member.parts:
+                raise RelockError(f"workspace member {member} is outside the project")
+            source = project / member / "pyproject.toml"
+            if not source.is_file():
+                continue
+            text, count = REQUIRES_PYTHON.subn(
+                rf'\g<1>"==3.{target.minor}.*"', source.read_text(encoding="utf-8"), count=1
+            )
+            narrowed += count
+            (copy / member).mkdir(parents=True, exist_ok=True)
+            (copy / member / "pyproject.toml").write_text(text, encoding="utf-8")
+        if not narrowed:
+            raise RelockError(f"no requires-python line found in {project / 'pyproject.toml'}")
+        for name in ("uv.lock", "uv.toml"):
+            if (project / name).is_file():
+                shutil.copy(project / name, copy / name)
+        try:
+            done = subprocess.run(
+                ["uv", "lock", *args], cwd=copy, capture_output=True, text=True, check=False
+            )
+        except FileNotFoundError:
+            raise SetupError("uv was not found on PATH") from None
+        if done.returncode:
+            raise RelockError(done.stderr)
+        return _load(copy / "uv.lock")
+
+
+def trim(stderr: str) -> str:
+    """Reduce uv's resolver failure output to the derivation."""
+    lines = stderr.strip().splitlines()
+    start = next((i for i, line in enumerate(lines) if "No solution found" in line), 0)
+    kept: list[str] = []
+    for line in lines[start:]:
+        if line.strip().startswith("hint:"):
+            break
+        if not VERSION_LINE.fullmatch(line):
+            kept.append(line)
+        elif not (kept and kept[-1].strip() == "…"):
+            kept.append("          …")
+    return textwrap.dedent("\n".join(kept)).strip()
