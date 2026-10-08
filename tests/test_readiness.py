@@ -10,6 +10,7 @@ from uv_readiness import (
     RelockError,
     SetupError,
     Target,
+    analyze,
     classify,
     parse_target,
     relock,
@@ -411,3 +412,183 @@ def test_trim_keeps_only_the_derivation() -> None:
     assert "your project depends on scipy<1.12" in result
     assert "hint:" not in result
     assert "Using CPython" not in result
+
+
+ALL = frozenset({"scipy", "pandas", "numpy", "pyyaml"})
+
+
+def stack(
+    *,
+    scipy: str = "1.11.4",
+    pandas: str = "2.2.1",
+    numpy: str = "1.26.4",
+    pyyaml: str = "6.0.1",
+    ready: frozenset[str] = frozenset(),
+    requires_python: str = ">=3.10",
+) -> dict[str, Any]:
+    """A lock whose packages have a cp312 wheel only, except those named in `ready` (cp313)."""
+
+    def entry(name: str, version: str, *deps: dict[str, Any]) -> dict[str, Any]:
+        tag = "cp313" if name in ready else "cp312"
+        return pkg(name, version, wheels=[f"{name}-{version}-{tag}-{tag}-win_amd64.whl"], deps=deps)
+
+    return lock(
+        project(dep("scipy"), dep("pandas"), dep("pyyaml")),
+        entry("scipy", scipy, dep("numpy")),
+        entry("pandas", pandas, dep("numpy")),
+        entry("numpy", numpy),
+        entry("pyyaml", pyyaml),
+        requires_python=requires_python,
+    )
+
+
+class FakeUv:
+    """A relocker that answers each kind of `uv lock` run with a canned lock or error."""
+
+    def __init__(self, **results: dict[str, Any] | Exception) -> None:
+        self.results = results
+        self.calls: list[tuple[str, ...]] = []
+
+    def __call__(self, *args: str) -> dict[str, Any]:
+        self.calls.append(args)
+        if "--no-build-package" in args:
+            kind = "why"
+        elif args == ("--upgrade",):
+            kind = "full"
+        else:
+            kind = "targeted" if args else "plain"
+        result = self.results[kind]
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+
+def test_ready_lock_never_runs_uv() -> None:
+    uv = FakeUv()
+    report = analyze(stack(ready=ALL), PY313, uv)
+    assert report.verdict == "ready"
+    assert set(statuses(report.packages).values()) == {"ready"}
+    assert uv.calls == []
+
+
+def test_offline_leaves_packages_without_a_wheel() -> None:
+    uv = FakeUv()
+    report = analyze(stack(), PY313, uv, offline=True)
+    assert set(statuses(report.packages).values()) == {"no-wheel"}
+    assert report.verdict == "not ready"
+    assert report.notes == ["run without --offline to check for fixes"]
+    assert uv.calls == []
+
+
+def test_fixable_and_blocked_packages_are_separated() -> None:
+    partly = stack(pandas="2.3.3", pyyaml="6.0.3", ready=frozenset({"pandas", "pyyaml"}))
+    uv = FakeUv(targeted=partly, full=partly, why=RelockError(NO_SOLUTION))
+    steps: list[str] = []
+
+    report = analyze(stack(), PY313, uv, step=steps.append)
+
+    assert statuses(report.packages) == {
+        "numpy": "blocked",
+        "pandas": "update",
+        "pyyaml": "update",
+        "scipy": "blocked",
+    }
+    assert {p.name: p.new_version for p in report.packages if p.status == "update"} == {
+        "pandas": "2.3.3",
+        "pyyaml": "6.0.3",
+    }
+    assert report.fix_command == "uv lock --upgrade-package pandas --upgrade-package pyyaml"
+    assert "your project depends on scipy<1.12" in (report.uv_explanation or "")
+    assert report.verdict == "not ready"
+    assert uv.calls == [
+        (
+            "--upgrade-package",
+            "numpy",
+            "--upgrade-package",
+            "pandas",
+            "--upgrade-package",
+            "pyyaml",
+            "--upgrade-package",
+            "scipy",
+        ),
+        ("--upgrade",),
+        ("--upgrade", "--no-build-package", "numpy", "--no-build-package", "scipy"),
+    ]
+    assert steps == [
+        "Upgrading packages without a wheel",
+        "Trying a full upgrade",
+        "Asking uv why",
+    ]
+
+
+def test_targeted_upgrade_that_fixes_everything_runs_uv_once() -> None:
+    fixed = stack(scipy="1.18.1", pandas="3.0.6", numpy="2.5.3", pyyaml="6.0.3", ready=ALL)
+    uv = FakeUv(targeted=fixed)
+    report = analyze(stack(), PY313, uv)
+    assert set(statuses(report.packages).values()) == {"update"}
+    assert report.verdict == "ready after updates"
+    assert report.fix_command == (
+        "uv lock --upgrade-package numpy --upgrade-package pandas"
+        " --upgrade-package pyyaml --upgrade-package scipy"
+    )
+    assert len(uv.calls) == 1
+
+
+def test_full_upgrade_is_suggested_when_targeted_is_not_enough() -> None:
+    fixed = stack(scipy="1.18.1", pandas="3.0.6", numpy="2.5.3", pyyaml="6.0.3", ready=ALL)
+    uv = FakeUv(targeted=stack(), full=fixed)
+    report = analyze(stack(), PY313, uv)
+    assert set(statuses(report.packages).values()) == {"update"}
+    assert {p.name: p.new_version for p in report.packages}["numpy"] == "2.5.3"
+    assert report.fix_command == "uv lock --upgrade"
+    assert report.verdict == "ready after updates"
+    assert len(uv.calls) == 2
+
+
+def test_target_outside_requires_python_cannot_run_offline() -> None:
+    with pytest.raises(SetupError, match="outside requires-python"):
+        analyze(stack(requires_python=">=3.10,<3.13"), PY313, FakeUv(), offline=True)
+
+
+def test_target_outside_requires_python_uses_a_narrowed_baseline() -> None:
+    narrowed = stack(pyyaml="6.0.3", ready=ALL, requires_python="==3.13.*")
+    uv = FakeUv(plain=narrowed)
+    report = analyze(stack(requires_python=">=3.10,<3.13"), PY313, uv)
+    by_name = {p.name: p for p in report.packages}
+    assert (by_name["pyyaml"].status, by_name["pyyaml"].version, by_name["pyyaml"].new_version) == (
+        "update",
+        "6.0.1",
+        "6.0.3",
+    )
+    assert by_name["numpy"].status == "ready"
+    assert report.verdict == "ready after updates"
+    assert report.notes == ["requires-python is >=3.10,<3.13; widen it to include 3.13"]
+    assert uv.calls == [()]
+
+
+def test_current_versions_that_do_not_resolve_fall_back_to_a_full_upgrade() -> None:
+    upgraded = stack(scipy="1.18.1", ready=ALL, requires_python="==3.13.*")
+    uv = FakeUv(plain=RelockError(NO_SOLUTION), full=upgraded)
+    report = analyze(stack(requires_python=">=3.10,<3.13"), PY313, uv)
+    assert report.resolved
+    assert report.fix_command == "uv lock --upgrade"
+    assert report.verdict == "ready after updates"
+    assert set(statuses(report.packages).values()) == {"ready"}
+    assert "No solution found" in (report.uv_explanation or "")
+
+
+def test_nothing_resolves_for_the_target() -> None:
+    uv = FakeUv(plain=RelockError(NO_SOLUTION), full=RelockError(NO_SOLUTION))
+    report = analyze(stack(requires_python=">=3.10,<3.13"), PY313, uv)
+    assert not report.resolved
+    assert report.packages == []
+    assert report.verdict == "not ready"
+    assert "uv lock --upgrade does not resolve either" in report.notes
+
+
+def test_resolver_failure_unrelated_to_readiness_keeps_the_offline_result() -> None:
+    uv = FakeUv(targeted=RelockError("error: Failed to build `app`"))
+    report = analyze(stack(), PY313, uv)
+    assert set(statuses(report.packages).values()) == {"no-wheel"}
+    assert report.notes == ["resolver pass unavailable:\nerror: Failed to build `app`"]
+    assert report.verdict == "not ready"

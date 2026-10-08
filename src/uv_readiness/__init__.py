@@ -7,12 +7,14 @@ import tempfile
 import textwrap
 import tomllib
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
 
 from packaging.markers import InvalidMarker, Marker
+from packaging.specifiers import SpecifierSet
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 Lock = dict[str, Any]
@@ -280,3 +282,173 @@ def trim(stderr: str) -> str:
         elif not (kept and kept[-1].strip() == "…"):
             kept.append("          …")
     return textwrap.dedent("\n".join(kept)).strip()
+
+
+Relocker = Callable[..., Lock]
+Step = Callable[[str], None]
+
+
+@dataclass
+class Report:
+    target: str
+    packages: list[Pkg] = field(default_factory=list)
+    fix_command: str | None = None
+    uv_explanation: str | None = None
+    notes: list[str] = field(default_factory=list)
+    resolved: bool = True
+
+    @property
+    def verdict(self) -> str:
+        statuses = {p.status for p in self.packages}
+        if not self.resolved or statuses & {"blocked", "no-wheel"}:
+            return "not ready"
+        if self.fix_command or "update" in statuses:
+            return "ready after updates"
+        return "ready"
+
+
+def in_range(lock: Lock, target: Target) -> bool:
+    spec = lock.get("requires-python")
+    if not spec:
+        return True
+    return any(SpecifierSet(spec).contains(f"3.{target.minor}.{patch}") for patch in (0, 99))
+
+
+def _unsolvable(error: RelockError) -> bool:
+    return "No solution found" in str(error)
+
+
+def _tail(error: RelockError) -> str:
+    return "\n".join(str(error).strip().splitlines()[-5:])
+
+
+def _flags(flag: str, names: list[str]) -> list[str]:
+    return [part for name in names for part in (flag, name)]
+
+
+def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, step: Step) -> None:
+    """Re-lock for the target and turn each `no-wheel` into `update` or `blocked`."""
+
+    def attempt(*args: str) -> dict[str, Pkg]:
+        # ponytail: keyed by name; a package locked at two versions for one Python keeps the last
+        return {p.name: p for p in classify(relocker(*args), target, original)}
+
+    def stuck(result: dict[str, Pkg], names: list[str]) -> list[str]:
+        return [n for n in names if n in result and result[n].status == "no-wheel"]
+
+    if not report.resolved:  # the current versions do not resolve for the target at all
+        step("Trying a full upgrade")
+        try:
+            upgraded = attempt("--upgrade")
+        except RelockError as error:
+            if not _unsolvable(error):
+                raise
+            report.notes.append("uv lock --upgrade does not resolve either")
+            return
+        report.resolved = True
+        report.fix_command = "uv lock --upgrade"
+        report.packages = sorted(upgraded.values(), key=lambda p: p.name)
+        for package in report.packages:
+            if package.status == "no-wheel":
+                package.status = "blocked"
+        return
+
+    current = {p.name: p for p in report.packages}
+    blockers = sorted(n for n, p in current.items() if p.status == "no-wheel")
+    step("Upgrading packages without a wheel")
+    result = attempt(*_flags("--upgrade-package", blockers))
+    still = stuck(result, blockers)
+    fixed = [n for n in blockers if n not in still]
+    command = "uv lock " + " ".join(_flags("--upgrade-package", fixed)) if fixed else None
+    pulled = [
+        n
+        for n, p in result.items()
+        if n in current
+        and n not in blockers
+        and current[n].status == "ready"
+        and p.version != current[n].version
+    ]
+    if still:
+        step("Trying a full upgrade")
+        full = attempt("--upgrade")
+        if len(stuck(full, still)) < len(still):
+            result, command, pulled = full, "uv lock --upgrade", []
+            still = stuck(full, still)
+
+    for name in blockers:
+        if name in still:
+            current[name].status = "blocked"
+        else:
+            current[name].status = "update"
+            current[name].new_version = result[name].version if name in result else None
+    for name in pulled:
+        current[name].status = "update"
+        current[name].new_version = result[name].version
+    report.fix_command = command
+
+    if still:
+        step("Asking uv why")
+        try:
+            relocker("--upgrade", *_flags("--no-build-package", still))
+        except RelockError as error:
+            if _unsolvable(error):
+                report.uv_explanation = trim(str(error))
+
+
+def _mark_forced(packages: list[Pkg], original: Lock) -> None:
+    """Show versions the narrowed re-lock had to change as updates from the locked version."""
+    locked: defaultdict[str, list[str]] = defaultdict(list)
+    for package in original.get("package", []):
+        if "version" in package:
+            locked[package["name"]].append(package["version"])
+    for p in packages:
+        versions = locked.get(p.name)
+        if not versions or p.version in versions:
+            continue
+        p.new_version = p.new_version or p.version
+        p.version = versions[0]
+        if p.status == "ready":
+            p.status = "update"
+
+
+def analyze(
+    original: Lock,
+    target: Target,
+    relocker: Relocker,
+    *,
+    offline: bool = False,
+    step: Step = lambda _: None,
+) -> Report:
+    report = Report(str(target))
+    baseline: Lock | None = original
+    if not in_range(original, target):
+        spec = original["requires-python"]
+        if offline:
+            raise SetupError(
+                f"Python {target} is outside requires-python ({spec}); "
+                "answering that needs the resolver, so --offline cannot be used"
+            )
+        report.notes.append(f"requires-python is {spec}; widen it to include 3.{target.minor}")
+        step(f"Resolving current versions for Python {target}")
+        try:
+            baseline = relocker()
+        except RelockError as error:
+            if not _unsolvable(error):
+                raise SetupError(
+                    f"could not resolve a copy of the project:\n{_tail(error)}"
+                ) from None
+            baseline, report.resolved, report.uv_explanation = None, False, trim(str(error))
+    if baseline is not None:
+        report.packages = classify(baseline, target, original)
+
+    waiting = baseline is None or any(p.status == "no-wheel" for p in report.packages)
+    if waiting and offline:
+        report.notes.append("run without --offline to check for fixes")
+    elif waiting:
+        try:
+            _fix(report, target, original, relocker, step)
+        except RelockError as error:
+            report.notes.append(f"resolver pass unavailable:\n{_tail(error)}")
+    if baseline is not None and baseline is not original:
+        _mark_forced(report.packages, original)
+    return report
