@@ -344,15 +344,11 @@ def trim(stderr: str) -> str:
     """Reduce uv's resolver failure output to the derivation."""
     lines = stderr.strip().splitlines()
     start = next((i for i, line in enumerate(lines) if "No solution found" in line), 0)
-    body = lines[start:]
-    bare = [bool(VERSION_LINE.fullmatch(line)) for line in body]
     kept: list[str] = []
-    for i, line in enumerate(body):
+    for line in lines[start:]:
         if line.strip().startswith("hint:"):
             break
-        # a version list is two or more bare requirements in a row; one alone is wrapped prose
-        listed = bare[i] and (bare[i - 1 : i] == [True] or bare[i + 1 : i + 2] == [True])
-        if not listed:
+        if not VERSION_LINE.fullmatch(line):
             kept.append(line)
         elif not (kept and kept[-1].strip() == "…"):
             kept.append("          …")
@@ -395,10 +391,7 @@ def _unsolvable(error: RelockError) -> bool:
 
 
 def _tail(error: RelockError) -> str:
-    """The last few lines of uv's error, without its trailing hints."""
-    lines = str(error).strip().splitlines()
-    end = next((i for i, line in enumerate(lines) if line.strip().startswith("hint:")), len(lines))
-    return "\n".join([line for line in lines[:end] if line.strip()][-5:])
+    return "\n".join(str(error).strip().splitlines()[-5:])
 
 
 def _flags(flag: str, names: list[str]) -> list[str]:
@@ -458,18 +451,12 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
         and all(p.status == "ready" for p in current[n])
         and _versions(found) != _versions(current[n])
     ]
-    failure: RelockError | None = None
     if still:
         step("Trying a full upgrade")
-        try:
-            full = attempt("--upgrade")
-        except RelockError as error:
-            if not _unsolvable(error):
-                failure = error  # keep what the targeted upgrade found; raised again below
-        else:
-            if len(stuck(full, still)) < len(still):
-                result, command, pulled = full, "uv lock --upgrade", []
-                still = stuck(full, still)
+        full = attempt("--upgrade")
+        if len(stuck(full, still)) < len(still):
+            result, command, pulled = full, "uv lock --upgrade", []
+            still = stuck(full, still)
     # an upgrade can move a ready package to a release that has no wheel for the target
     regressed = [
         n
@@ -481,20 +468,18 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
         for package in current[name]:
             if package.status != "no-wheel":
                 continue  # another locked version of the same package that already has a wheel
-            if name not in still:
+            if name in still:
+                package.status = "blocked"
+            else:
                 found = result.get(name, [])
                 package.status = "update"
                 package.new_version = _versions(found)
                 package.evidence = found[0].evidence if found else None
-            elif failure is None:
-                package.status = "blocked"
     for name in pulled + regressed:
         for package in current[name]:
             package.status = "blocked" if name in regressed else "update"
             package.new_version = _versions(result[name])
     report.fix_command = command
-    if failure:
-        raise failure
 
     if still:
         step("Asking uv why")

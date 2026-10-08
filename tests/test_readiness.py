@@ -644,23 +644,6 @@ def test_resolver_failure_unrelated_to_readiness_keeps_the_offline_result() -> N
     assert report.verdict == "not ready"
 
 
-def test_failed_full_upgrade_keeps_what_the_targeted_upgrade_found() -> None:
-    partly = stack(pandas="2.3.3", pyyaml="6.0.3", ready=frozenset({"pandas", "pyyaml"}))
-    uv = FakeUv(
-        targeted=partly,
-        full=RelockError("error: Failed to build `app`\n\n  hint: This usually means\n  trouble"),
-    )
-    report = analyze(stack(), PY313, uv)
-    assert statuses(report.packages) == {
-        "numpy": "no-wheel",
-        "pandas": "update",
-        "pyyaml": "update",
-        "scipy": "no-wheel",
-    }
-    assert report.fix_command == "uv lock --upgrade-package pandas --upgrade-package pyyaml"
-    assert report.notes == ["resolver pass unavailable:\nerror: Failed to build `app`"]
-
-
 def test_an_upgrade_that_costs_another_package_its_wheel_is_not_ready() -> None:
     before = stack(ready=frozenset({"scipy", "pandas", "pyyaml"}))
     after = stack(numpy="2.5.3", pandas="3.0.6", ready=frozenset({"scipy", "numpy", "pyyaml"}))
@@ -680,18 +663,6 @@ def test_conflict_extra_markers_do_not_prune_dependencies() -> None:
         PY313,
     )
     assert statuses(result) == {"numba": "ready"}
-
-
-def test_trim_keeps_a_requirement_that_wrapped_onto_its_own_line() -> None:
-    text = (
-        "  × No solution found when resolving dependencies:\n"
-        "  ╰─▶ Because your project depends on scipy<1.12 and scipy<1.12 depends on\n"
-        "      numpy<1.28\n"
-        "      and numpy<1.28 has no usable wheels, the requirements are unsatisfiable.\n"
-    )
-    result = trim(text)
-    assert "numpy<1.28\n" in result
-    assert "…" not in result
 
 
 def test_render_skips_a_workspace_member_with_nothing_left_to_show() -> None:
