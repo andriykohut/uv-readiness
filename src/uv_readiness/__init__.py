@@ -1,14 +1,17 @@
 """Check whether a uv project's locked dependencies are ready for a Python version."""
 
+import argparse
+import json
 import re
 import shutil
 import subprocess
 import tempfile
 import textwrap
 import tomllib
-from collections import defaultdict
-from collections.abc import Callable
-from dataclasses import dataclass, field
+from collections import Counter, defaultdict
+from collections.abc import Callable, Sequence
+from dataclasses import asdict, dataclass, field
+from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
 from urllib.parse import unquote, urlsplit
@@ -16,6 +19,12 @@ from urllib.parse import unquote, urlsplit
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import SpecifierSet
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
+from rich.console import Console, RenderableType
+from rich.panel import Panel
+from rich.progress import BarColumn, MofNCompleteColumn, Progress, SpinnerColumn, TextColumn
+from rich.table import Table
+from rich.text import Text
+from rich.tree import Tree
 
 Lock = dict[str, Any]
 Package = dict[str, Any]
@@ -452,3 +461,207 @@ def analyze(
     if baseline is not None and baseline is not original:
         _mark_forced(report.packages, original)
     return report
+
+
+SUMMARY = [
+    ("blocked", "blocked"),
+    ("no-wheel", "without a wheel"),
+    ("update", "to update"),
+    ("ready", "ready"),
+]
+COLOURS = {"ready": "green", "ready after updates": "yellow", "not ready": "red"}
+FOOTNOTES = [
+    ("source-only", "Source only", "sdist only, can't tell from wheels"),
+    ("unchecked", "Not checked", "git, path or local source"),
+]
+
+
+def _label(package: Pkg) -> str:
+    return f"{package.name} {package.version or ''}".strip()
+
+
+def _blocked(report: Report) -> list[RenderableType]:
+    """Trees from the project down to each package without a wheel, pruned to those paths."""
+    tag = "cp" + report.target.replace(".", "")
+    by_name = {p.name: p for p in report.packages}
+    bad = {n for n, p in by_name.items() if p.status in ("blocked", "no-wheel")}
+
+    def label(name: str, parent: str | None) -> Text:
+        text = Text(_label(by_name[name]))
+        if name in bad:
+            text.append(f"  ✗ no {tag} wheel", style="red")
+            others = [n for n in by_name[name].required_by if n != parent]
+            if parent and others:
+                text.append(f"  (also via {', '.join(others)})", style="dim")
+        return text
+
+    children: defaultdict[str, list[str]] = defaultdict(list)
+    for package in report.packages:
+        for parent in package.required_by:
+            children[parent].append(package.name)
+    leads, todo = set(bad), list(bad)
+    while todo:
+        name = todo.pop()
+        for parent in by_name[name].required_by if name in by_name else []:
+            if parent not in leads:
+                leads.add(parent)
+                todo.append(parent)
+    roots = sorted(name for name in leads if name not in by_name)
+    if not roots:
+        return [label(name, None) for name in sorted(bad)]
+
+    seen: set[str] = set()
+
+    def grow(parent: str) -> list[Tree]:
+        """Branches under `parent` that end in a package without a wheel, those packages first."""
+        branches: list[Tree] = []
+        for child in sorted(children[parent], key=lambda name: (name not in bad, name)):
+            if child not in leads or child in seen:
+                continue
+            seen.add(child)
+            branch = Tree(label(child, parent))
+            branch.children.extend(grow(child))
+            if child in bad or branch.children:
+                branches.append(branch)
+        return branches
+
+    trees: list[RenderableType] = []
+    for root in roots:
+        tree = Tree(Text(root, style="bold"))
+        tree.children.extend(grow(root))
+        trees.append(tree)
+    return trees
+
+
+def render_text(report: Report, console: Console, *, verbose: bool = False) -> None:
+    counts = Counter(p.status for p in report.packages)
+    summary = " · ".join(f"{counts[status]} {label}" for status, label in SUMMARY if counts[status])
+    console.print(
+        Text.assemble(
+            (f"Python {report.target}", "bold"),
+            " · ",
+            (report.verdict, f"bold {COLOURS[report.verdict]}"),
+            "    ",
+            (summary, "dim"),
+        )
+    )
+    for note in report.notes:
+        console.print(Text(note, style="dim"))
+
+    if counts["blocked"] or counts["no-wheel"]:
+        heading = "Blocked" if counts["blocked"] else f"No wheel for {report.target}"
+        console.print(Text(f"\n{heading}", style="bold"))
+        for renderable in _blocked(report):
+            console.print(renderable)
+    if report.uv_explanation:
+        console.print(
+            Panel(
+                Text(report.uv_explanation),
+                title="why (uv)",
+                title_align="left",
+                border_style="dim",
+            )
+        )
+
+    updates = [p for p in report.packages if p.status == "update"]
+    if updates:
+        console.print(Text("\nUpdate", style="bold"))
+        table = Table(box=None, pad_edge=False, padding=(0, 2))
+        table.add_column("package")
+        table.add_column("locked")
+        table.add_column("resolves to", style="green")
+        for package in updates:
+            table.add_row(
+                Text(package.name),
+                Text(package.version or ""),
+                Text(package.new_version or "no longer needed"),
+            )
+        console.print(table)
+    if report.fix_command:
+        console.print(Text(f"\nResolved for Python {report.target}:", style="dim"))
+        console.print(Text(f"  {report.fix_command}", style="bold cyan"), soft_wrap=True)
+
+    for status, heading, reason in FOOTNOTES:
+        names = [_label(p) for p in report.packages if p.status == status]
+        if names:
+            console.print(
+                Text.assemble(
+                    (f"\n{heading} ({len(names)})", "bold"),
+                    f"  {', '.join(names)}",
+                    (f" · {reason}", "dim"),
+                )
+            )
+    if verbose and counts["ready"]:
+        console.print(Text(f"\nReady ({counts['ready']})", style="bold"))
+        for package in report.packages:
+            if package.status == "ready":
+                console.print(Text(f"  {_label(package)}"))
+
+
+def render_json(report: Report) -> str:
+    packages = [
+        {key: value for key, value in asdict(p).items() if value is not None}
+        for p in report.packages
+    ]
+    return json.dumps(
+        {
+            "target": report.target,
+            "verdict": report.verdict,
+            "packages": packages,
+            "fix_command": report.fix_command,
+            "uv_explanation": report.uv_explanation,
+            "notes": report.notes,
+        },
+        indent=2,
+    )
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="uv-readiness",
+        description="Check whether a uv project's locked dependencies are ready for a Python version.",
+    )
+    parser.add_argument("python", help="target Python version, e.g. 3.13 or 3.14t")
+    parser.add_argument(
+        "--project", type=Path, default=Path("."), help="project root containing uv.lock"
+    )
+    parser.add_argument("--offline", action="store_true", help="skip every step that runs uv lock")
+    parser.add_argument("--json", action="store_true", help="print the report as JSON")
+    parser.add_argument("--verbose", action="store_true", help="also list ready packages")
+    args = parser.parse_args(argv)
+
+    errors = Console(stderr=True)
+    try:
+        target = parse_target(args.python)
+        lock_path = args.project / "uv.lock"
+        if not lock_path.is_file():
+            raise SetupError(f"no uv.lock in {args.project.resolve()}; run `uv lock` first")
+        original = _load(lock_path)
+        with Progress(
+            SpinnerColumn(),
+            TextColumn("{task.description}"),
+            BarColumn(),
+            MofNCompleteColumn(),
+            console=errors,
+            transient=True,
+            disable=args.json or not errors.is_terminal,
+        ) as progress:
+            # stages: reading the lock, then at most three uv runs (four when re-locking a baseline)
+            stages = 4 if in_range(original, target) else 5
+            task = progress.add_task("Reading uv.lock", total=stages)
+            report = analyze(
+                original,
+                target,
+                partial(relock, args.project, target),
+                offline=args.offline,
+                step=lambda label: progress.update(task, description=label, advance=1),
+            )
+    except (SetupError, tomllib.TOMLDecodeError) as error:
+        errors.print(Text.assemble(("error: ", "bold red"), str(error)))
+        return 2
+
+    if args.json:
+        print(render_json(report))
+    else:
+        render_text(report, Console(), verbose=args.verbose)
+    return 0 if report.verdict == "ready" else 1

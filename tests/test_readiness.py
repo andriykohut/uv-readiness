@@ -1,19 +1,26 @@
+import io
+import json
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
 import pytest
+from rich.console import Console
 
 from uv_readiness import (
     Pkg,
     RelockError,
+    Report,
     SetupError,
     Target,
     analyze,
     classify,
+    main,
     parse_target,
     relock,
+    render_json,
+    render_text,
     trim,
     wheel_supports,
 )
@@ -592,3 +599,104 @@ def test_resolver_failure_unrelated_to_readiness_keeps_the_offline_result() -> N
     assert set(statuses(report.packages).values()) == {"no-wheel"}
     assert report.notes == ["resolver pass unavailable:\nerror: Failed to build `app`"]
     assert report.verdict == "not ready"
+
+
+def render(report: Report, *, verbose: bool = False) -> str:
+    buffer = io.StringIO()
+    render_text(report, Console(file=buffer, width=100), verbose=verbose)
+    return buffer.getvalue()
+
+
+MIXED = Report(
+    "3.13",
+    [
+        Pkg("idna", "3.20", "ready", ["app"]),
+        Pkg("legacy", "0.3", "source-only", ["app"]),
+        Pkg("mylib", None, "unchecked", ["app"]),
+        Pkg("numpy", "1.26.4", "blocked", ["pandas", "scipy"]),
+        Pkg("pandas", "2.2.1", "update", ["app"], "2.3.3"),
+        Pkg("scipy", "1.11.4", "blocked", ["app"]),
+    ],
+    fix_command="uv lock --upgrade-package pandas",
+    uv_explanation="httpx[http2] and scipy<=1.11.4 have no usable wheels",
+)
+
+
+def test_render_puts_problems_first() -> None:
+    out = render(MIXED)
+    lines = out.splitlines()
+    assert "Python 3.13 · not ready" in lines[0]
+    assert "2 blocked · 1 to update · 1 ready" in lines[0]
+    assert out.index("Blocked") < out.index("Update") < out.index("Source only")
+    assert "scipy 1.11.4  ✗ no cp313 wheel" in out
+    assert "numpy 1.26.4  ✗ no cp313 wheel  (also via pandas)" in out
+    assert "uv lock --upgrade-package pandas" in out
+    assert "2.2.1" in out and "2.3.3" in out
+    assert "legacy 0.3" in out and "mylib" in out
+    assert "idna" not in out
+
+
+def test_render_keeps_square_brackets_literal() -> None:
+    assert "httpx[http2] and scipy<=1.11.4 have no usable wheels" in render(MIXED)
+
+
+def test_render_verbose_lists_ready_packages() -> None:
+    assert "idna 3.20" in render(MIXED, verbose=True)
+
+
+def test_render_lists_blocked_packages_flat_without_a_project() -> None:
+    out = render(Report("3.13", [Pkg("numpy", "1.26.4", "no-wheel")]))
+    assert "No wheel for 3.13" in out
+    assert "numpy 1.26.4  ✗ no cp313 wheel" in out
+
+
+def test_render_json_shape() -> None:
+    data = json.loads(render_json(MIXED))
+    assert data["target"] == "3.13"
+    assert data["verdict"] == "not ready"
+    assert data["fix_command"] == "uv lock --upgrade-package pandas"
+    assert data["notes"] == []
+    assert {
+        "name": "pandas",
+        "version": "2.2.1",
+        "status": "update",
+        "required_by": ["app"],
+        "new_version": "2.3.3",
+    } in data["packages"]
+    assert {"name": "idna", "version": "3.20", "status": "ready", "required_by": ["app"]} in data[
+        "packages"
+    ]
+
+
+def test_main_ready_exits_zero(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["3.12", "--project", str(make_project(tmp_path))]) == 0
+    assert "Python 3.12 · ready" in capsys.readouterr().out
+
+
+def test_main_offline_reports_missing_wheel(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    assert main(["3.13", "--project", str(make_project(tmp_path)), "--offline"]) == 1
+    out = capsys.readouterr().out
+    assert "not ready" in out
+    assert "numpy 1.26.4  ✗ no cp313 wheel" in out
+    assert "run without --offline" in out
+
+
+def test_main_json_prints_only_json(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["3.13", "--project", str(make_project(tmp_path)), "--offline", "--json"]) == 1
+    data = json.loads(capsys.readouterr().out)
+    assert {p["name"]: p["status"] for p in data["packages"]} == {
+        "idna": "ready",
+        "numpy": "no-wheel",
+    }
+
+
+def test_main_rejects_a_bad_target(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["python3", "--project", str(make_project(tmp_path))]) == 2
+    assert "not a Python version" in capsys.readouterr().err
+
+
+def test_main_needs_a_lockfile(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    assert main(["3.13", "--project", str(tmp_path)]) == 2
+    assert "uv.lock" in capsys.readouterr().err
