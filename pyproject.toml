@@ -1,0 +1,30 @@
+[project]
+name = "uv-readiness"
+version = "0.1.0"
+description = "Check whether a uv project's locked dependencies are ready for a Python version."
+readme = "README.md"
+license = "MIT"
+authors = [{ name = "Andrii Kohut", email = "kogut.andriy@gmail.com" }]
+requires-python = ">=3.11"
+dependencies = ["packaging>=24.0", "rich>=13.0"]
+
+[project.scripts]
+uv-readiness = "uv_readiness:main"
+
+[dependency-groups]
+dev = ["pytest>=8.0", "ruff>=0.6", "ty>=0.0.1"]
+
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "ANN"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+markers = ["network: runs real `uv lock` against PyPI"]
+addopts = "-m 'not network'"
