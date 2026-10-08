@@ -1,10 +1,12 @@
 """Check whether a uv project's locked dependencies are ready for a Python version."""
 
 import argparse
+import io
 import json
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import textwrap
 import tomllib
@@ -256,6 +258,7 @@ def classify(lock: Lock, target: Target, original: Lock | None = None) -> list[P
 
 # ponytail: regex edit of requires-python; a project that sets it another way loses the resolver pass
 REQUIRES_PYTHON = re.compile(r"""^(\s*requires-python\s*=\s*)(["']).*?\2""", re.MULTILINE)
+DYNAMIC = re.compile(r"^(\s*dynamic\s*=\s*\[)([^\]]*)\]", re.MULTILINE)
 VERSION_LINE = re.compile(r"\s+[\w.\-]+\s?(==|>=|<=|>|<)\s?[\w.*+!]+")
 
 
@@ -273,37 +276,62 @@ def _member_dirs(lock: Lock) -> set[Path]:
     return dirs
 
 
+def _static_version(pyproject: str) -> str:
+    """Give a dynamically versioned project a fixed version, so uv need not build it to lock."""
+    # ponytail: regex edit of the `dynamic` array; comments inside the array are not handled
+    match = DYNAMIC.search(pyproject)
+    if not match:
+        return pyproject
+    items = [item.strip() for item in match[2].split(",") if item.strip()]
+    kept = [item for item in items if item.strip("\"'") != "version"]
+    if len(kept) == len(items):
+        return pyproject
+    static = f'{match[1]}{", ".join(kept)}]\nversion = "0"'
+    return pyproject[: match.start()] + static + pyproject[match.end() :]
+
+
 def relock(project: Path, target: Target, *args: str) -> Lock:
     """Run `uv lock *args` on a copy of the project pinned to the target Python."""
+    original = _load(project / "uv.lock")
+    pin = rf'\g<1>"==3.{target.minor}.*"'
     with tempfile.TemporaryDirectory(prefix="uv-readiness-") as tmp:
         copy = Path(tmp)
         narrowed = 0
-        for member in _member_dirs(_load(project / "uv.lock")):
+        for member in _member_dirs(original):
             if member.is_absolute() or ".." in member.parts:
                 raise RelockError(f"workspace member {member} is outside the project")
             source = project / member / "pyproject.toml"
             if not source.is_file():
                 continue
             text, count = REQUIRES_PYTHON.subn(
-                rf'\g<1>"==3.{target.minor}.*"', source.read_text(encoding="utf-8"), count=1
+                pin, _static_version(source.read_text(encoding="utf-8")), count=1
             )
             narrowed += count
             (copy / member).mkdir(parents=True, exist_ok=True)
             (copy / member / "pyproject.toml").write_text(text, encoding="utf-8")
         if not narrowed:
             raise RelockError(f"no requires-python line found in {project / 'pyproject.toml'}")
-        for name in ("uv.lock", "uv.toml"):
-            if (project / name).is_file():
-                shutil.copy(project / name, copy / name)
+        # The lock's own requires-python is pinned too: uv reads the lock's fork markers
+        # against it, and drops every package when they fall outside the new range.
+        lock_text = (project / "uv.lock").read_text(encoding="utf-8")
+        (copy / "uv.lock").write_text(
+            REQUIRES_PYTHON.sub(pin, lock_text, count=1), encoding="utf-8"
+        )
+        if (project / "uv.toml").is_file():
+            shutil.copy(project / "uv.toml", copy / "uv.toml")
+        # --project and --directory are explicit so UV_PROJECT or UV_WORKING_DIRECTORY in the
+        # environment cannot point uv back at the real project.
+        command = ["uv", "lock", "--project", str(copy), "--directory", str(copy), *args]
         try:
-            done = subprocess.run(
-                ["uv", "lock", *args], cwd=copy, capture_output=True, text=True, check=False
-            )
+            done = subprocess.run(command, cwd=copy, capture_output=True, text=True, check=False)
         except FileNotFoundError:
             raise SetupError("uv was not found on PATH") from None
         if done.returncode:
             raise RelockError(done.stderr)
-        return _load(copy / "uv.lock")
+        result = _load(copy / "uv.lock")
+    if _roots(original) and not _roots(result):
+        raise RelockError("uv returned a lock without the project")
+    return result
 
 
 def trim(stderr: str) -> str:
@@ -364,20 +392,31 @@ def _flags(flag: str, names: list[str]) -> list[str]:
     return [part for name in names for part in (flag, name)]
 
 
+def _by_name(packages: list[Pkg]) -> dict[str, list[Pkg]]:
+    """Group packages by name; one name has several entries when it is locked at several versions."""
+    groups: defaultdict[str, list[Pkg]] = defaultdict(list)
+    for package in packages:
+        groups[package.name].append(package)
+    return dict(groups)
+
+
+def _versions(packages: list[Pkg]) -> str | None:
+    return ", ".join(sorted({p.version for p in packages if p.version})) or None
+
+
 def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, step: Step) -> None:
     """Re-lock for the target and turn each `no-wheel` into `update` or `blocked`."""
 
-    def attempt(*args: str) -> dict[str, Pkg]:
-        # ponytail: keyed by name; a package locked at two versions for one Python keeps the last
-        return {p.name: p for p in classify(relocker(*args), target, original)}
+    def attempt(*args: str) -> dict[str, list[Pkg]]:
+        return _by_name(classify(relocker(*args), target, original))
 
-    def stuck(result: dict[str, Pkg], names: list[str]) -> list[str]:
-        return [n for n in names if n in result and result[n].status == "no-wheel"]
+    def stuck(result: dict[str, list[Pkg]], names: list[str]) -> list[str]:
+        return [n for n in names if any(p.status == "no-wheel" for p in result.get(n, []))]
 
     if not report.resolved:  # the current versions do not resolve for the target at all
         step("Trying a full upgrade")
         try:
-            upgraded = attempt("--upgrade")
+            upgraded = classify(relocker("--upgrade"), target, original)
         except RelockError as error:
             if not _unsolvable(error):
                 raise
@@ -385,14 +424,14 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
             return
         report.resolved = True
         report.fix_command = "uv lock --upgrade"
-        report.packages = sorted(upgraded.values(), key=lambda p: p.name)
+        report.packages = upgraded
         for package in report.packages:
             if package.status == "no-wheel":
                 package.status = "blocked"
         return
 
-    current = {p.name: p for p in report.packages}
-    blockers = sorted(n for n, p in current.items() if p.status == "no-wheel")
+    current = _by_name(report.packages)
+    blockers = stuck(current, sorted(current))
     step("Upgrading packages without a wheel")
     result = attempt(*_flags("--upgrade-package", blockers))
     still = stuck(result, blockers)
@@ -400,11 +439,11 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
     command = "uv lock " + " ".join(_flags("--upgrade-package", fixed)) if fixed else None
     pulled = [
         n
-        for n, p in result.items()
+        for n, found in result.items()
         if n in current
         and n not in blockers
-        and current[n].status == "ready"
-        and p.version != current[n].version
+        and all(p.status == "ready" for p in current[n])
+        and _versions(found) != _versions(current[n])
     ]
     if still:
         step("Trying a full upgrade")
@@ -414,15 +453,20 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
             still = stuck(full, still)
 
     for name in blockers:
-        if name in still:
-            current[name].status = "blocked"
-        else:
-            current[name].status = "update"
-            current[name].new_version = result[name].version if name in result else None
-            current[name].evidence = result[name].evidence if name in result else None
+        for package in current[name]:
+            if package.status != "no-wheel":
+                continue  # another locked version of the same package that already has a wheel
+            if name in still:
+                package.status = "blocked"
+            else:
+                found = result.get(name, [])
+                package.status = "update"
+                package.new_version = _versions(found)
+                package.evidence = found[0].evidence if found else None
     for name in pulled:
-        current[name].status = "update"
-        current[name].new_version = result[name].version
+        for package in current[name]:
+            package.status = "update"
+            package.new_version = _versions(result[name])
     report.fix_command = command
 
     if still:
@@ -554,30 +598,37 @@ def _label(package: Pkg) -> str:
 def _blocked(report: Report) -> list[RenderableType]:
     """Trees from the project down to each package without a wheel, pruned to those paths."""
     tag = "cp" + report.target.replace(".", "")
-    by_name = {p.name: p for p in report.packages}
-    bad = {n for n, p in by_name.items() if p.status in ("blocked", "no-wheel")}
+    groups = _by_name(report.packages)
+    lacking = {
+        name: [p for p in found if p.status in ("blocked", "no-wheel")]
+        for name, found in groups.items()
+    }
+    bad = {name for name, found in lacking.items() if found}
+    parents = {
+        name: sorted({parent for p in found for parent in p.required_by})
+        for name, found in groups.items()
+    }
 
     def label(name: str, parent: str | None) -> Text:
-        text = Text(_label(by_name[name]))
+        text = Text(f"{name} {_versions(lacking[name] or groups[name]) or ''}".strip())
         if name in bad:
             text.append(f"  ✗ no {tag} wheel", style="red")
-            others = [n for n in by_name[name].required_by if n != parent]
+            others = [n for n in parents[name] if n != parent]
             if parent and others:
                 text.append(f"  (also via {', '.join(others)})", style="dim")
         return text
 
     children: defaultdict[str, list[str]] = defaultdict(list)
-    for package in report.packages:
-        for parent in package.required_by:
-            children[parent].append(package.name)
+    for name, found in parents.items():
+        for parent in found:
+            children[parent].append(name)
     leads, todo = set(bad), list(bad)
     while todo:
-        name = todo.pop()
-        for parent in by_name[name].required_by if name in by_name else []:
+        for parent in parents.get(todo.pop(), []):
             if parent not in leads:
                 leads.add(parent)
                 todo.append(parent)
-    roots = sorted(name for name in leads if name not in by_name)
+    roots = sorted(name for name in leads if name not in groups)
     if not roots:
         return [label(name, None) for name in sorted(bad)]
 
@@ -734,6 +785,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--verbose", action="store_true", help="also list ready packages")
     args = parser.parse_args(argv)
+    for stream in (sys.stdout, sys.stderr):
+        # a cp1252 pipe (redirected output on Windows) cannot encode ✗ or box drawing
+        if isinstance(stream, io.TextIOWrapper):
+            stream.reconfigure(errors="replace")
 
     errors = Console(stderr=True)
     try:

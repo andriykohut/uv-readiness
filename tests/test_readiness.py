@@ -2,6 +2,8 @@ import io
 import json
 import re
 import subprocess
+import sys
+import tomllib
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -336,15 +338,22 @@ def make_project(root: Path, pyproject: str = PYPROJECT, lock_text: str = LOCK_T
     return root
 
 
+NARROWED_LOCK = LOCK_TOML.replace('requires-python = ">=3.10"', 'requires-python = "==3.13.*"')
+
+
 class FakeRun:
     """Stands in for subprocess.run and records what uv would have seen."""
 
-    def __init__(self, returncode: int = 0, stderr: str = "") -> None:
+    def __init__(
+        self, returncode: int = 0, stderr: str = "", lock_text: str = NARROWED_LOCK
+    ) -> None:
         self.returncode = returncode
         self.stderr = stderr
+        self.lock_text = lock_text
         self.commands: list[list[str]] = []
         self.cwd = Path()
         self.pyproject = ""
+        self.lock = ""
 
     def __call__(
         self, command: list[str], *, cwd: Path, **_: object
@@ -352,9 +361,8 @@ class FakeRun:
         self.commands.append(command)
         self.cwd = Path(cwd)
         self.pyproject = (self.cwd / "pyproject.toml").read_text(encoding="utf-8")
-        (self.cwd / "uv.lock").write_text(
-            'version = 1\nrequires-python = "==3.13.*"\n', encoding="utf-8"
-        )
+        self.lock = (self.cwd / "uv.lock").read_text(encoding="utf-8")
+        (self.cwd / "uv.lock").write_text(self.lock_text, encoding="utf-8")
         return subprocess.CompletedProcess(command, self.returncode, "", self.stderr)
 
 
@@ -365,13 +373,42 @@ def test_relock_runs_uv_on_a_narrowed_copy(tmp_path: Path, monkeypatch: pytest.M
 
     result = relock(project_dir, PY313, "--upgrade")
 
-    assert run.commands == [["uv", "lock", "--upgrade"]]
+    copy = str(run.cwd)
+    assert run.commands == [["uv", "lock", "--project", copy, "--directory", copy, "--upgrade"]]
     assert 'requires-python = "==3.13.*"' in run.pyproject
+    assert 'requires-python = "==3.13.*"' in run.lock
+    assert 'requires-python = ">=3.10"' not in run.lock
     assert result["requires-python"] == "==3.13.*"
     assert run.cwd != project_dir
     assert not run.cwd.exists()
     assert (project_dir / "pyproject.toml").read_text(encoding="utf-8") == PYPROJECT
     assert (project_dir / "uv.lock").read_text(encoding="utf-8") == LOCK_TOML
+
+
+def test_relock_rejects_a_lock_that_lost_the_project(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run = FakeRun(lock_text='version = 1\nrequires-python = "==3.13.*"\n')
+    monkeypatch.setattr("uv_readiness.subprocess.run", run)
+    with pytest.raises(RelockError, match="without the project"):
+        relock(make_project(tmp_path), PY313)
+
+
+def test_relock_gives_a_dynamically_versioned_project_a_static_version(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    pyproject = (
+        '[project]\nname = "app"\ndynamic = ["version", "readme"]\n'
+        'requires-python = ">=3.10"\ndependencies = ["idna", "numpy"]\n\n'
+        '[tool.hatch.version]\npath = "src/app/__init__.py"\n'
+    )
+    run = FakeRun()
+    monkeypatch.setattr("uv_readiness.subprocess.run", run)
+    relock(make_project(tmp_path, pyproject=pyproject), PY313)
+    copied = tomllib.loads(run.pyproject)["project"]
+    assert copied["version"] == "0"
+    assert copied["dynamic"] == ["readme"]
+    assert copied["dependencies"] == ["idna", "numpy"]
 
 
 def test_relock_raises_with_uv_stderr(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -604,6 +641,60 @@ def test_resolver_failure_unrelated_to_readiness_keeps_the_offline_result() -> N
     assert report.verdict == "not ready"
 
 
+def two_numpys(old_tag: str, new_tag: str) -> dict[str, Any]:
+    """A lock where numpy is locked at two versions for the same Python, split by platform."""
+    return lock(
+        project(
+            dep("numpy", version="1.26.4", marker="sys_platform == 'win32'"),
+            dep("numpy", version="2.0.2", marker="sys_platform != 'win32'"),
+        ),
+        pkg("numpy", "1.26.4", wheels=[f"numpy-1.26.4-{old_tag}-{old_tag}-win_amd64.whl"]),
+        pkg("numpy", "2.0.2", wheels=[f"numpy-2.0.2-{new_tag}-{new_tag}-macosx_14_0_arm64.whl"]),
+    )
+
+
+def test_both_versions_of_a_package_locked_twice_are_fixed() -> None:
+    fixed = lock(
+        project(dep("numpy")),
+        pkg("numpy", "2.5.3", wheels=["numpy-2.5.3-cp313-cp313-win_amd64.whl"]),
+    )
+    uv = FakeUv(targeted=fixed)
+    report = analyze(two_numpys("cp312", "cp312"), PY313, uv)
+    assert [(p.version, p.status, p.new_version) for p in report.packages] == [
+        ("1.26.4", "update", "2.5.3"),
+        ("2.0.2", "update", "2.5.3"),
+    ]
+    assert report.verdict == "ready after updates"
+    assert uv.calls == [("--upgrade-package", "numpy")]
+
+
+def test_a_version_without_a_wheel_is_not_hidden_by_a_ready_one() -> None:
+    unchanged = two_numpys("cp312", "cp313")
+    uv = FakeUv(targeted=unchanged, full=unchanged, why=RelockError(NO_SOLUTION))
+    report = analyze(two_numpys("cp312", "cp313"), PY313, uv)
+    assert [(p.version, p.status) for p in report.packages] == [
+        ("1.26.4", "blocked"),
+        ("2.0.2", "ready"),
+    ]
+    assert uv.calls[0] == ("--upgrade-package", "numpy")
+    out = render(report)
+    assert "numpy 1.26.4  ✗ no cp313 wheel" in out
+    assert "numpy 2.0.2" not in out
+
+
+def test_render_lists_every_version_without_a_wheel() -> None:
+    out = render(
+        Report(
+            "3.13",
+            [
+                Pkg("numpy", "1.26.4", "no-wheel", ["app"]),
+                Pkg("numpy", "2.0.2", "no-wheel", ["app"]),
+            ],
+        )
+    )
+    assert "numpy 1.26.4, 2.0.2  ✗ no cp313 wheel" in out
+
+
 def render(report: Report, *, verbose: bool = False) -> str:
     buffer = io.StringIO()
     render_text(report, Console(file=buffer, width=100), verbose=verbose)
@@ -695,6 +786,17 @@ def test_main_json_prints_only_json(tmp_path: Path, capsys: pytest.CaptureFixtur
     }
 
 
+def test_main_survives_a_stdout_that_cannot_encode_the_report(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    raw = io.BytesIO()
+    stream = io.TextIOWrapper(raw, encoding="cp1252")
+    monkeypatch.setattr(sys, "stdout", stream)
+    assert main(["3.13", "--project", str(make_project(tmp_path)), "--offline"]) == 1
+    stream.flush()
+    assert b"numpy 1.26.4" in raw.getvalue()
+
+
 def test_main_rejects_a_bad_target(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["python3", "--project", str(make_project(tmp_path))]) == 2
     assert "not a Python version" in capsys.readouterr().err
@@ -705,25 +807,84 @@ def test_main_needs_a_lockfile(tmp_path: Path, capsys: pytest.CaptureFixture[str
     assert "uv.lock" in capsys.readouterr().err
 
 
+def locked_project(root: Path, pyproject: str) -> Path:
+    """A real project locked as of 2024-03-01, before any package had a cp313 wheel."""
+    (root / "pyproject.toml").write_text(pyproject, encoding="utf-8")
+    subprocess.run(["uv", "lock", "--exclude-newer", "2024-03-01"], cwd=root, check=True)
+    return root
+
+
+def run_json(project_dir: Path, capsys: pytest.CaptureFixture[str]) -> tuple[int, dict[str, Any]]:
+    """Run the tool for 3.13 on a real project and check it left the lock alone."""
+    before = (project_dir / "uv.lock").read_text(encoding="utf-8")
+    code = main(["3.13", "--project", str(project_dir), "--json"])
+    assert (project_dir / "uv.lock").read_text(encoding="utf-8") == before
+    return code, json.loads(capsys.readouterr().out)
+
+
+PYYAML_ONLY = (
+    '[project]\nname = "probe"\nversion = "0"\nrequires-python = ">=3.10"\n'
+    'dependencies = ["pyyaml"]\n'
+)
+
+
 @pytest.mark.network
 def test_real_uv_finds_the_update(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
-    (tmp_path / "pyproject.toml").write_text(
-        '[project]\nname = "probe"\nversion = "0"\nrequires-python = ">=3.10"\n'
-        'dependencies = ["pyyaml"]\n',
-        encoding="utf-8",
-    )
-    # pyyaml 6.0.1 was the newest release on this date and has no cp313 wheel
-    subprocess.run(["uv", "lock", "--exclude-newer", "2024-03-01"], cwd=tmp_path, check=True)
-    before = (tmp_path / "uv.lock").read_text(encoding="utf-8")
-
-    assert main(["3.13", "--project", str(tmp_path), "--json"]) == 1
-
-    data = json.loads(capsys.readouterr().out)
+    code, data = run_json(locked_project(tmp_path, PYYAML_ONLY), capsys)
+    assert code == 1
     assert data["verdict"] == "ready after updates"
     assert data["fix_command"] == "uv lock --upgrade-package pyyaml"
     (pyyaml,) = data["packages"]
     assert (pyyaml["status"], pyyaml["version"]) == ("update", "6.0.1")
-    assert (tmp_path / "uv.lock").read_text(encoding="utf-8") == before
+
+
+@pytest.mark.network
+def test_real_uv_is_pinned_to_the_copy_despite_the_environment(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_dir = locked_project(tmp_path, PYYAML_ONLY)
+    monkeypatch.setenv("UV_PROJECT", str(project_dir))
+    monkeypatch.setenv("UV_WORKING_DIRECTORY", str(project_dir))
+    code, data = run_json(project_dir, capsys)
+    assert code == 1
+    assert data["fix_command"] == "uv lock --upgrade-package pyyaml"
+
+
+@pytest.mark.network
+def test_real_uv_capped_project_with_forks_is_not_reported_ready(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project_dir = locked_project(
+        tmp_path,
+        '[project]\nname = "probe"\nversion = "0"\nrequires-python = ">=3.10,<3.13"\n'
+        'dependencies = ["scipy<1.12", "pandas", "pyyaml", "idna", "httpx[http2]"]\n',
+    )
+    assert "resolution-markers" in (project_dir / "uv.lock").read_text(encoding="utf-8")
+    code, data = run_json(project_dir, capsys)
+    assert code == 1
+    assert data["verdict"] == "not ready"
+    found = {p["name"]: p["status"] for p in data["packages"]}
+    assert found["scipy"] == "blocked"
+    assert found["idna"] == "ready"
+
+
+@pytest.mark.network
+def test_real_uv_handles_a_dynamically_versioned_project(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    (tmp_path / "probe").mkdir()
+    (tmp_path / "probe" / "__init__.py").write_text('__version__ = "1.2.3"\n', encoding="utf-8")
+    project_dir = locked_project(
+        tmp_path,
+        '[project]\nname = "probe"\ndynamic = ["version"]\nrequires-python = ">=3.10"\n'
+        'dependencies = ["pyyaml"]\n\n'
+        '[build-system]\nrequires = ["hatchling"]\nbuild-backend = "hatchling.build"\n\n'
+        '[tool.hatch.version]\npath = "probe/__init__.py"\n',
+    )
+    code, data = run_json(project_dir, capsys)
+    assert code == 1
+    assert data["fix_command"] == "uv lock --upgrade-package pyyaml"
+    assert data["notes"] == []
 
 
 PYPI = "https://pypi.org/simple"
