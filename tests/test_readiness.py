@@ -1,5 +1,6 @@
 import io
 import json
+import re
 import subprocess
 from collections.abc import Sequence
 from pathlib import Path
@@ -15,7 +16,9 @@ from uv_readiness import (
     SetupError,
     Target,
     analyze,
+    check_classifiers,
     classify,
+    fetch_classifiers,
     main,
     parse_target,
     relock,
@@ -721,3 +724,233 @@ def test_real_uv_finds_the_update(tmp_path: Path, capsys: pytest.CaptureFixture[
     (pyyaml,) = data["packages"]
     assert (pyyaml["status"], pyyaml["version"]) == ("update", "6.0.1")
     assert (tmp_path / "uv.lock").read_text(encoding="utf-8") == before
+
+
+PYPI = "https://pypi.org/simple"
+
+
+@pytest.fixture(autouse=True)
+def no_pypi(monkeypatch: pytest.MonkeyPatch, request: pytest.FixtureRequest) -> None:
+    """Keep every test off the network unless it is marked `network`."""
+    if "network" not in request.keywords:
+        monkeypatch.setattr("uv_readiness.fetch_classifiers", lambda name, version: None)
+
+
+def classifiers(*minors: int) -> list[str]:
+    return [
+        "Programming Language :: Python :: 3",
+        *(f"Programming Language :: Python :: 3.{minor}" for minor in minors),
+        "Typing :: Typed",
+    ]
+
+
+def independent(
+    name: str,
+    version: str,
+    status: str = "ready",
+    new_version: str | None = None,
+    declared: list[str] | None = None,
+) -> Pkg:
+    """A package from PyPI whose wheels are not tied to a Python version."""
+    return Pkg(
+        name,
+        version,
+        status,
+        ["app"],
+        new_version,
+        evidence="version-independent",
+        registry=PYPI,
+        declared=declared,
+    )
+
+
+def test_classify_records_evidence_and_registry() -> None:
+    result = classify(
+        lock(
+            project(dep("built"), dep("pure"), dep("stable"), dep("both"), dep("private")),
+            pkg("built", wheels=["built-1.0-cp313-cp313-win_amd64.whl"]),
+            pkg("pure", wheels=[PURE]),
+            pkg("stable", wheels=["stable-1.0-cp39-abi3-win_amd64.whl"]),
+            pkg(
+                "both",
+                wheels=["both-1.0-cp39-abi3-win_amd64.whl", "both-1.0-cp313-cp313-win_amd64.whl"],
+            ),
+            pkg("private", wheels=[PURE], source={"registry": "https://pkgs.example/simple"}),
+        ),
+        PY313,
+    )
+    assert {p.name: p.evidence for p in result} == {
+        "built": "target-wheel",
+        "pure": "version-independent",
+        "stable": "version-independent",
+        "both": "target-wheel",
+        "private": "version-independent",
+    }
+    registries = {p.name: p.registry for p in result}
+    assert registries["pure"] == PYPI
+    assert registries["private"] == "https://pkgs.example/simple"
+
+
+def test_packages_without_a_wheel_have_no_evidence() -> None:
+    report = analyze(stack(), PY313, FakeUv(), offline=True)
+    assert {p.evidence for p in report.packages} == {None}
+
+
+def test_updated_packages_carry_the_evidence_of_the_new_version() -> None:
+    fixed = stack(scipy="1.18.1", pandas="3.0.6", numpy="2.5.3", pyyaml="6.0.3", ready=ALL)
+    report = analyze(stack(), PY313, FakeUv(targeted=fixed))
+    assert {p.evidence for p in report.packages} == {"target-wheel"}
+
+
+def test_check_classifiers_asks_pypi_about_version_independent_packages_only() -> None:
+    report = Report(
+        "3.13",
+        [
+            independent("good", "1.0"),
+            independent("lags", "2.0"),
+            independent("updated", "1.0", "update", "1.5"),
+            independent("unreachable", "1.0"),
+            Pkg("built", "1.0", "ready", ["app"], evidence="target-wheel", registry=PYPI),
+            Pkg(
+                "private",
+                "1.0",
+                "ready",
+                ["app"],
+                evidence="version-independent",
+                registry="https://pkgs.example/simple",
+            ),
+            Pkg("blocked", "1.0", "blocked", ["app"], registry=PYPI),
+        ],
+    )
+    answers = {
+        ("good", "1.0"): classifiers(12, 13),
+        ("lags", "2.0"): classifiers(12, 11),
+        ("updated", "1.5"): classifiers(13),
+    }
+    asked: list[tuple[str, str]] = []
+    ticks: list[int] = []
+
+    def fetch(name: str, version: str) -> list[str] | None:
+        asked.append((name, version))
+        return answers.get((name, version))
+
+    check_classifiers(report, fetch, lambda: ticks.append(1))
+
+    assert sorted(asked) == [
+        ("good", "1.0"),
+        ("lags", "2.0"),
+        ("unreachable", "1.0"),
+        ("updated", "1.5"),
+    ]
+    assert {p.name: p.declared for p in report.packages} == {
+        "good": ["3.12", "3.13"],
+        "lags": ["3.11", "3.12"],
+        "updated": ["3.13"],
+        "unreachable": None,
+        "built": None,
+        "private": None,
+        "blocked": None,
+    }
+    assert len(ticks) == 4
+    assert report.classifiers_checked
+
+
+def test_summary_splits_ready_packages_by_evidence() -> None:
+    out = render(
+        Report(
+            "3.13",
+            [
+                Pkg("a", "1", "ready", evidence="target-wheel"),
+                Pkg("b", "1", "ready", evidence="version-independent"),
+                Pkg("c", "1", "ready", evidence="version-independent"),
+            ],
+        )
+    )
+    assert "3 ready (1 with a cp313 wheel, 2 version-independent)" in out
+    assert "Classifiers" not in out
+
+
+def test_summary_says_when_no_ready_package_is_tied_to_the_target() -> None:
+    out = render(Report("3.99", [Pkg("a", "1", "ready", evidence="version-independent")]))
+    assert "1 ready (all version-independent)" in out
+
+
+def test_render_classifiers_lists_packages_that_do_not_declare_the_target() -> None:
+    out = render(
+        Report(
+            "3.13",
+            [
+                independent("bare", "1.0", declared=[]),
+                independent("good", "1.0", declared=["3.12", "3.13"]),
+                independent("lags", "2.0", declared=["3.11", "3.12"]),
+                independent("unreachable", "1.0"),
+            ],
+            classifiers_checked=True,
+        )
+    )
+    assert "1 declare 3.13 · 2 don't · 1 unknown" in out
+    assert re.search(r"lags\s+2\.0\s+up to 3\.12", out)
+    assert re.search(r"bare\s+1\.0\s+no Python versions", out)
+    assert not re.search(r"good\s+1\.0", out)
+
+
+def test_render_json_includes_evidence_and_declared_versions() -> None:
+    report = Report(
+        "3.13",
+        [
+            Pkg(
+                "good",
+                "1.0",
+                "ready",
+                ["app"],
+                evidence="version-independent",
+                registry=PYPI,
+                declared=["3.13"],
+            )
+        ],
+    )
+    assert json.loads(render_json(report))["packages"] == [
+        {
+            "name": "good",
+            "version": "1.0",
+            "status": "ready",
+            "required_by": ["app"],
+            "evidence": "version-independent",
+            "registry": PYPI,
+            "declared": ["3.13"],
+        }
+    ]
+
+
+def test_main_checks_classifiers_by_default(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asked: list[tuple[str, str]] = []
+
+    def fetch(name: str, version: str) -> list[str]:
+        asked.append((name, version))
+        return classifiers(11, 12)
+
+    monkeypatch.setattr("uv_readiness.fetch_classifiers", fetch)
+    assert main(["3.12", "--project", str(make_project(tmp_path))]) == 0
+    assert asked == [("idna", "3.20")]
+    assert "1 declare 3.12" in capsys.readouterr().out
+
+
+def test_main_offline_never_asks_pypi(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def fetch(name: str, version: str) -> list[str]:
+        raise AssertionError("asked PyPI while offline")
+
+    monkeypatch.setattr("uv_readiness.fetch_classifiers", fetch)
+    assert main(["3.12", "--project", str(make_project(tmp_path)), "--offline"]) == 0
+    assert "Classifiers" not in capsys.readouterr().out
+
+
+@pytest.mark.network
+def test_fetch_classifiers_from_pypi() -> None:
+    found = fetch_classifiers("idna", "3.10")
+    assert found is not None
+    assert "Programming Language :: Python :: 3.12" in found
+    assert fetch_classifiers("idna", "0.0.0.0.1") is None

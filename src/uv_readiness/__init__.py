@@ -8,13 +8,15 @@ import subprocess
 import tempfile
 import textwrap
 import tomllib
+import urllib.request
 from collections import Counter, defaultdict
 from collections.abc import Callable, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass, field
 from functools import partial
 from pathlib import Path
 from typing import Any, NamedTuple
-from urllib.parse import unquote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from packaging.markers import InvalidMarker, Marker
 from packaging.specifiers import SpecifierSet
@@ -28,6 +30,11 @@ from rich.tree import Tree
 
 Lock = dict[str, Any]
 Package = dict[str, Any]
+
+PYPI = "https://pypi.org/simple"
+# what a wheel says about the target Python: built for it, or installable on any version
+BUILT = "target-wheel"
+INDEPENDENT = "version-independent"
 
 
 class SetupError(Exception):
@@ -57,30 +64,37 @@ def parse_target(text: str) -> Target:
     return Target(int(match[1]), bool(match[2]))
 
 
-def _tag_supports(interpreter: str, abi: str, target: Target) -> bool:
+def _tag_evidence(interpreter: str, abi: str, target: Target) -> str | None:
     match = re.fullmatch(r"(py|cp)3(\d*)", interpreter)
     if not match:
-        return False
+        return None
     minor = int(match[2]) if match[2] else None
     if match[1] == "py":
-        return abi == "none" and (minor is None or minor <= target.minor)
+        return INDEPENDENT if abi == "none" and (minor is None or minor <= target.minor) else None
     if minor is None:
-        return False
+        return None
     if abi == "abi3":
         # ponytail: abi3t (free-threaded stable ABI) is not recognised; add it when wheels use it
-        return minor <= target.minor and not target.free_threaded
-    if minor != target.minor:
-        return False
-    return abi in ("none", target.tag)
+        return INDEPENDENT if minor <= target.minor and not target.free_threaded else None
+    return BUILT if minor == target.minor and abi in ("none", target.tag) else None
 
 
-def wheel_supports(filename: str, target: Target) -> bool:
-    """Whether a wheel installs on the target Python. Platform tags are ignored."""
+def _strongest(found: set[str | None]) -> str | None:
+    return BUILT if BUILT in found else INDEPENDENT if INDEPENDENT in found else None
+
+
+def wheel_evidence(filename: str, target: Target) -> str | None:
+    """How a wheel supports the target Python, if it does. Platform tags are ignored."""
     try:
         tags = parse_wheel_filename(filename)[3]
     except InvalidWheelFilename:
-        return False
-    return any(_tag_supports(tag.interpreter, tag.abi, target) for tag in tags)
+        return None
+    return _strongest({_tag_evidence(tag.interpreter, tag.abi, target) for tag in tags})
+
+
+def wheel_supports(filename: str, target: Target) -> bool:
+    """Whether a wheel installs on the target Python."""
+    return wheel_evidence(filename, target) is not None
 
 
 # ponytail: four mainstream platforms; a dependency gated on any other platform counts as unreachable
@@ -121,6 +135,9 @@ class Pkg:
     status: str
     required_by: list[str] = field(default_factory=list)
     new_version: str | None = None
+    evidence: str | None = None
+    registry: str | None = None
+    declared: list[str] | None = None
 
 
 def _roots(lock: Lock) -> list[Package]:
@@ -214,15 +231,26 @@ def classify(lock: Lock, target: Target, original: Lock | None = None) -> list[P
     result: list[Pkg] = []
     for (name, version), (package, parents) in reachable(lock, target).items():
         names = _wheel_names(package)
-        if not {"registry", "url"} & package.get("source", {}).keys():
+        source = package.get("source", {})
+        evidence = _strongest({wheel_evidence(wheel, target) for wheel in names})
+        if not {"registry", "url"} & source.keys():
             status = "unchecked"
-        elif any(wheel_supports(wheel, target) for wheel in names):
+        elif evidence:
             status = "ready"
         elif names or name in had_wheels:
             status = "no-wheel"
         else:
             status = "source-only"
-        result.append(Pkg(name, version, status, sorted(parents)))
+        result.append(
+            Pkg(
+                name,
+                version,
+                status,
+                sorted(parents),
+                evidence=evidence if status == "ready" else None,
+                registry=source.get("registry"),
+            )
+        )
     return sorted(result, key=lambda p: (p.name, p.version or ""))
 
 
@@ -305,6 +333,7 @@ class Report:
     uv_explanation: str | None = None
     notes: list[str] = field(default_factory=list)
     resolved: bool = True
+    classifiers_checked: bool = False
 
     @property
     def verdict(self) -> str:
@@ -390,6 +419,7 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
         else:
             current[name].status = "update"
             current[name].new_version = result[name].version if name in result else None
+            current[name].evidence = result[name].evidence if name in result else None
     for name in pulled:
         current[name].status = "update"
         current[name].new_version = result[name].version
@@ -461,6 +491,47 @@ def analyze(
     if baseline is not None and baseline is not original:
         _mark_forced(report.packages, original)
     return report
+
+
+Fetch = Callable[[str, str], list[str] | None]
+
+
+def fetch_classifiers(name: str, version: str) -> list[str] | None:
+    """Trove classifiers of one release on PyPI, or None when they cannot be fetched."""
+    url = f"https://pypi.org/pypi/{quote(name)}/{quote(version)}/json"
+    request = urllib.request.Request(url, headers={"User-Agent": "uv-readiness"})
+    try:
+        with urllib.request.urlopen(request, timeout=10) as response:
+            return json.load(response)["info"]["classifiers"]
+    except (OSError, ValueError, KeyError):
+        return None
+
+
+def _candidates(report: Report) -> list[Pkg]:
+    """Packages whose wheels say nothing about the target, and that PyPI can be asked about."""
+    return [
+        p
+        for p in report.packages
+        if p.status in ("ready", "update") and p.evidence == INDEPENDENT and p.registry == PYPI
+    ]
+
+
+def check_classifiers(
+    report: Report, fetch: Fetch, tick: Callable[[], None] = lambda: None
+) -> None:
+    """Record which Python versions each version-independent package declares on PyPI."""
+
+    def check(package: Pkg) -> None:
+        found = fetch(package.name, package.new_version or package.version or "")
+        if found is not None:
+            pattern = r"Programming Language :: Python :: 3\.(\d+)"
+            minors = {int(m[1]) for line in found if (m := re.fullmatch(pattern, line))}
+            package.declared = [f"3.{minor}" for minor in sorted(minors)]
+        tick()
+
+    with ThreadPoolExecutor(max_workers=16) as pool:
+        list(pool.map(check, _candidates(report)))
+    report.classifiers_checked = True
 
 
 SUMMARY = [
@@ -535,7 +606,14 @@ def _blocked(report: Report) -> list[RenderableType]:
 
 def render_text(report: Report, console: Console, *, verbose: bool = False) -> None:
     counts = Counter(p.status for p in report.packages)
-    summary = " · ".join(f"{counts[status]} {label}" for status, label in SUMMARY if counts[status])
+    tag = "cp" + report.target.replace(".", "")
+    parts = [f"{counts[status]} {label}" for status, label in SUMMARY if counts[status]]
+    ready = Counter(p.evidence for p in report.packages if p.status == "ready")
+    if ready[BUILT] and ready[INDEPENDENT]:
+        parts[-1] += f" ({ready[BUILT]} with a {tag} wheel, {ready[INDEPENDENT]} {INDEPENDENT})"
+    elif ready[BUILT] or ready[INDEPENDENT]:
+        parts[-1] += f" (all with a {tag} wheel)" if ready[BUILT] else f" (all {INDEPENDENT})"
+    summary = " · ".join(parts)
     console.print(
         Text.assemble(
             (f"Python {report.target}", "bold"),
@@ -591,6 +669,31 @@ def render_text(report: Report, console: Console, *, verbose: bool = False) -> N
                     (f" · {reason}", "dim"),
                 )
             )
+    asked = _candidates(report)
+    if report.classifiers_checked and asked:
+        python = report.target.rstrip("t")
+        missing = [p for p in asked if p.declared is not None and python not in p.declared]
+        unknown = sum(p.declared is None for p in asked)
+        tally = [f"{len(asked) - len(missing) - unknown} declare {python}", f"{len(missing)} don't"]
+        if unknown:
+            tally.append(f"{unknown} unknown")
+        console.print(Text.assemble(("\nClassifiers", "bold"), "  ", " · ".join(tally)))
+        if missing:
+            table = Table(box=None, pad_edge=False, padding=(0, 2))
+            table.add_column("package")
+            table.add_column("version")
+            table.add_column("declares", style="yellow")
+            for package in missing:
+                declares = (
+                    f"up to {package.declared[-1]}" if package.declared else "no Python versions"
+                )
+                table.add_row(
+                    Text(package.name), Text(package.new_version or package.version or ""), declares
+                )
+            console.print(table)
+        console.print(
+            Text("Declared by package authors, often late. This never changes the verdict.", "dim")
+        )
     if verbose and counts["ready"]:
         console.print(Text(f"\nReady ({counts['ready']})", style="bold"))
         for package in report.packages:
@@ -625,7 +728,9 @@ def main(argv: Sequence[str] | None = None) -> int:
     parser.add_argument(
         "--project", type=Path, default=Path("."), help="project root containing uv.lock"
     )
-    parser.add_argument("--offline", action="store_true", help="skip every step that runs uv lock")
+    parser.add_argument(
+        "--offline", action="store_true", help="only read uv.lock: no uv lock runs, no PyPI lookups"
+    )
     parser.add_argument("--json", action="store_true", help="print the report as JSON")
     parser.add_argument("--verbose", action="store_true", help="also list ready packages")
     args = parser.parse_args(argv)
@@ -656,6 +761,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 offline=args.offline,
                 step=lambda label: progress.update(task, description=label, advance=1),
             )
+            if not args.offline:
+                progress.update(task, visible=False)
+                checking = progress.add_task(
+                    "Asking PyPI for classifiers", total=len(_candidates(report))
+                )
+                check_classifiers(report, fetch_classifiers, lambda: progress.advance(checking))
     except (SetupError, tomllib.TOMLDecodeError) as error:
         errors.print(Text.assemble(("error: ", "bold red"), str(error)))
         return 2
