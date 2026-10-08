@@ -374,7 +374,9 @@ def test_relock_runs_uv_on_a_narrowed_copy(tmp_path: Path, monkeypatch: pytest.M
     result = relock(project_dir, PY313, "--upgrade")
 
     copy = str(run.cwd)
-    assert run.commands == [["uv", "lock", "--project", copy, "--directory", copy, "--upgrade"]]
+    assert run.commands == [
+        ["uv", "lock", "--project", copy, "--directory", copy, "--python", "3.13", "--upgrade"]
+    ]
     assert 'requires-python = "==3.13.*"' in run.pyproject
     assert 'requires-python = "==3.13.*"' in run.lock
     assert 'requires-python = ">=3.10"' not in run.lock
@@ -610,6 +612,7 @@ def test_target_outside_requires_python_uses_a_narrowed_baseline() -> None:
     assert by_name["numpy"].status == "ready"
     assert report.verdict == "ready after updates"
     assert report.notes == ["requires-python is >=3.10,<3.13; widen it to include 3.13"]
+    assert report.fix_command == "uv lock"
     assert uv.calls == [()]
 
 
@@ -639,6 +642,67 @@ def test_resolver_failure_unrelated_to_readiness_keeps_the_offline_result() -> N
     assert set(statuses(report.packages).values()) == {"no-wheel"}
     assert report.notes == ["resolver pass unavailable:\nerror: Failed to build `app`"]
     assert report.verdict == "not ready"
+
+
+def test_failed_full_upgrade_keeps_what_the_targeted_upgrade_found() -> None:
+    partly = stack(pandas="2.3.3", pyyaml="6.0.3", ready=frozenset({"pandas", "pyyaml"}))
+    uv = FakeUv(
+        targeted=partly,
+        full=RelockError("error: Failed to build `app`\n\n  hint: This usually means\n  trouble"),
+    )
+    report = analyze(stack(), PY313, uv)
+    assert statuses(report.packages) == {
+        "numpy": "no-wheel",
+        "pandas": "update",
+        "pyyaml": "update",
+        "scipy": "no-wheel",
+    }
+    assert report.fix_command == "uv lock --upgrade-package pandas --upgrade-package pyyaml"
+    assert report.notes == ["resolver pass unavailable:\nerror: Failed to build `app`"]
+
+
+def test_an_upgrade_that_costs_another_package_its_wheel_is_not_ready() -> None:
+    before = stack(ready=frozenset({"scipy", "pandas", "pyyaml"}))
+    after = stack(numpy="2.5.3", pandas="3.0.6", ready=frozenset({"scipy", "numpy", "pyyaml"}))
+    report = analyze(before, PY313, FakeUv(targeted=after))
+    found = {p.name: (p.status, p.new_version) for p in report.packages}
+    assert found["numpy"] == ("update", "2.5.3")
+    assert found["pandas"] == ("blocked", "3.0.6")
+    assert report.verdict == "not ready"
+
+
+def test_conflict_extra_markers_do_not_prune_dependencies() -> None:
+    result = classify(
+        lock(
+            project(dep("numba", marker="extra == 'extra-5-probe-old'")),
+            pkg("numba", wheels=[PURE]),
+        ),
+        PY313,
+    )
+    assert statuses(result) == {"numba": "ready"}
+
+
+def test_trim_keeps_a_requirement_that_wrapped_onto_its_own_line() -> None:
+    text = (
+        "  × No solution found when resolving dependencies:\n"
+        "  ╰─▶ Because your project depends on scipy<1.12 and scipy<1.12 depends on\n"
+        "      numpy<1.28\n"
+        "      and numpy<1.28 has no usable wheels, the requirements are unsatisfiable.\n"
+    )
+    result = trim(text)
+    assert "numpy<1.28\n" in result
+    assert "…" not in result
+
+
+def test_render_skips_a_workspace_member_with_nothing_left_to_show() -> None:
+    out = render(Report("3.13", [Pkg("numpy", "1.26.4", "blocked", ["alpha", "beta"])]))
+    assert out.splitlines()[-2:] == ["alpha", "└── numpy 1.26.4  ✗ no cp313 wheel  (also via beta)"]
+
+
+def test_render_does_not_say_a_package_is_required_by_itself() -> None:
+    out = render(Report("3.13", [Pkg("celery", "5.3", "blocked", ["app", "celery"])]))
+    assert "celery 5.3  ✗ no cp313 wheel\n" in out
+    assert "also via" not in out
 
 
 def two_numpys(old_tag: str, new_tag: str) -> dict[str, Any]:
@@ -845,6 +909,7 @@ def test_real_uv_is_pinned_to_the_copy_despite_the_environment(
     project_dir = locked_project(tmp_path, PYYAML_ONLY)
     monkeypatch.setenv("UV_PROJECT", str(project_dir))
     monkeypatch.setenv("UV_WORKING_DIRECTORY", str(project_dir))
+    monkeypatch.setenv("UV_PYTHON", "3.12")
     code, data = run_json(project_dir, capsys)
     assert code == 1
     assert data["fix_command"] == "uv lock --upgrade-package pyyaml"

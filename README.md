@@ -82,6 +82,11 @@ blocked, `2` means the tool could not run.
   are never sent to PyPI.
 - Platform tags are ignored: a wheel for the target Python on any platform
   counts.
+- Dependency markers are evaluated for Linux (x86_64 and aarch64), macOS
+  (arm64) and Windows (x86_64). A dependency that only applies elsewhere is
+  not checked.
+- A target outside the project's `requires-python` needs the resolver, so
+  `--offline` exits with an error for it.
 - The suggested command is resolved against a copy pinned to the target Python.
   In a project that spans several Python versions uv may choose other versions
   for the older ones.
