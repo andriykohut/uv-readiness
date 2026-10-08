@@ -700,3 +700,24 @@ def test_main_rejects_a_bad_target(tmp_path: Path, capsys: pytest.CaptureFixture
 def test_main_needs_a_lockfile(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     assert main(["3.13", "--project", str(tmp_path)]) == 2
     assert "uv.lock" in capsys.readouterr().err
+
+
+@pytest.mark.network
+def test_real_uv_finds_the_update(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    (tmp_path / "pyproject.toml").write_text(
+        '[project]\nname = "probe"\nversion = "0"\nrequires-python = ">=3.10"\n'
+        'dependencies = ["pyyaml"]\n',
+        encoding="utf-8",
+    )
+    # pyyaml 6.0.1 was the newest release on this date and has no cp313 wheel
+    subprocess.run(["uv", "lock", "--exclude-newer", "2024-03-01"], cwd=tmp_path, check=True)
+    before = (tmp_path / "uv.lock").read_text(encoding="utf-8")
+
+    assert main(["3.13", "--project", str(tmp_path), "--json"]) == 1
+
+    data = json.loads(capsys.readouterr().out)
+    assert data["verdict"] == "ready after updates"
+    assert data["fix_command"] == "uv lock --upgrade-package pyyaml"
+    (pyyaml,) = data["packages"]
+    assert (pyyaml["status"], pyyaml["version"]) == ("update", "6.0.1")
+    assert (tmp_path / "uv.lock").read_text(encoding="utf-8") == before
