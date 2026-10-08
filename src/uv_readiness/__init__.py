@@ -1,8 +1,12 @@
 """Check whether a uv project's locked dependencies are ready for a Python version."""
 
 import re
+from collections import defaultdict
+from dataclasses import dataclass, field
 from typing import Any, NamedTuple
+from urllib.parse import unquote, urlsplit
 
+from packaging.markers import InvalidMarker, Marker
 from packaging.utils import InvalidWheelFilename, parse_wheel_filename
 
 Lock = dict[str, Any]
@@ -56,3 +60,146 @@ def wheel_supports(filename: str, target: Target) -> bool:
     except InvalidWheelFilename:
         return False
     return any(_tag_supports(tag.interpreter, tag.abi, target) for tag in tags)
+
+
+# ponytail: four mainstream platforms; a dependency gated on any other platform counts as unreachable
+ENVIRONMENTS: list[dict[str, str]] = [
+    {
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "os_name": "posix",
+        "platform_machine": "x86_64",
+    },
+    {
+        "sys_platform": "linux",
+        "platform_system": "Linux",
+        "os_name": "posix",
+        "platform_machine": "aarch64",
+    },
+    {
+        "sys_platform": "darwin",
+        "platform_system": "Darwin",
+        "os_name": "posix",
+        "platform_machine": "arm64",
+    },
+    {
+        "sys_platform": "win32",
+        "platform_system": "Windows",
+        "os_name": "nt",
+        "platform_machine": "AMD64",
+    },
+]
+
+Key = tuple[str, str | None]
+
+
+@dataclass
+class Pkg:
+    name: str
+    version: str | None
+    status: str
+    required_by: list[str] = field(default_factory=list)
+    new_version: str | None = None
+
+
+def _roots(lock: Lock) -> list[Package]:
+    """The project and its workspace members."""
+    packages: list[Package] = lock.get("package", [])
+    members = set(lock.get("manifest", {}).get("members", []))
+    if members:
+        return [p for p in packages if p["name"] in members]
+    return [
+        p
+        for p in packages
+        if "." in (p.get("source", {}).get("editable"), p.get("source", {}).get("virtual"))
+    ]
+
+
+def _live(marker: str | None, target: Target) -> bool:
+    """Whether a dependency edge can apply on the target Python on any mainstream platform."""
+    if not marker:
+        return True
+    python = {
+        "python_version": f"3.{target.minor}",
+        "python_full_version": f"3.{target.minor}.0",
+        "implementation_name": "cpython",
+        "platform_python_implementation": "CPython",
+    }
+    try:
+        parsed = Marker(marker)
+    except InvalidMarker:
+        return True
+    return any(parsed.evaluate({**environment, **python}) for environment in ENVIRONMENTS)
+
+
+def reachable(lock: Lock, target: Target) -> dict[Key, tuple[Package, set[str]]]:
+    """Map (name, version) to (package, names requiring it) for what installs on the target."""
+    packages: list[Package] = lock.get("package", [])
+    roots = _roots(lock)
+    if not roots:
+        return {(p["name"], p.get("version")): (p, set()) for p in packages}
+    root_names = {p["name"] for p in roots}
+    by_name: defaultdict[str, list[Package]] = defaultdict(list)
+    for package in packages:
+        by_name[package["name"]].append(package)
+
+    found: dict[Key, tuple[Package, set[str]]] = {}
+    seen: set[tuple[Key, frozenset[str]]] = set()
+    # extras is None for a project root: follow every extra and every dependency group
+    todo: list[tuple[Package, frozenset[str] | None]] = [(root, None) for root in roots]
+    while todo:
+        package, extras = todo.pop()
+        optional: dict[str, list[dict[str, Any]]] = package.get("optional-dependencies", {})
+        edges: list[dict[str, Any]] = list(package.get("dependencies", []))
+        if extras is None:
+            groups = [*optional.values(), *package.get("dev-dependencies", {}).values()]
+        else:
+            groups = [optional.get(extra, []) for extra in extras]
+        for group in groups:
+            edges += group
+        for edge in edges:
+            if not _live(edge.get("marker"), target):
+                continue
+            for child in by_name[edge["name"]]:
+                if child["name"] in root_names:
+                    continue
+                if "version" in edge and child.get("version") != edge["version"]:
+                    continue
+                key = (child["name"], child.get("version"))
+                found.setdefault(key, (child, set()))[1].add(package["name"])
+                wanted = frozenset(edge.get("extra", []))
+                if (key, wanted) not in seen:
+                    seen.add((key, wanted))
+                    todo.append((child, wanted))
+    return found
+
+
+def _wheel_names(package: Package) -> list[str]:
+    refs = [
+        w.get("filename") or w.get("url") or w.get("path") or "" for w in package.get("wheels", [])
+    ]
+    refs.append(package.get("source", {}).get("url", ""))
+    names = [unquote(urlsplit(ref).path).rsplit("/", 1)[-1] for ref in refs]
+    return [name for name in names if name.endswith(".whl")]
+
+
+def classify(lock: Lock, target: Target, original: Lock | None = None) -> list[Pkg]:
+    """Status of every reachable package.
+
+    Pass `original` when `lock` is a re-lock narrowed to the target: its wheel lists are
+    already filtered, so the original tells a missing wheel from a source-only package.
+    """
+    had_wheels = {p["name"] for p in (original or {}).get("package", []) if p.get("wheels")}
+    result: list[Pkg] = []
+    for (name, version), (package, parents) in reachable(lock, target).items():
+        names = _wheel_names(package)
+        if not {"registry", "url"} & package.get("source", {}).keys():
+            status = "unchecked"
+        elif any(wheel_supports(wheel, target) for wheel in names):
+            status = "ready"
+        elif names or name in had_wheels:
+            status = "no-wheel"
+        else:
+            status = "source-only"
+        result.append(Pkg(name, version, status, sorted(parents)))
+    return sorted(result, key=lambda p: (p.name, p.version or ""))
