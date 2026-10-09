@@ -1,6 +1,6 @@
 name: Release
 
-# Publishes to PyPI when a version tag is pushed:
+# Publishes to PyPI and creates a GitHub release when a version tag is pushed:
 #
 #     git tag v0.1.0 && git push origin v0.1.0
 #
@@ -45,3 +45,18 @@ jobs:
           name: dist
           path: dist/
       - run: uv publish
+
+  github-release:
+    needs: publish
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - run: gh release create "$GITHUB_REF_NAME" dist/* --verify-tag --generate-notes
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
