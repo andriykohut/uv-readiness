@@ -1,0 +1,47 @@
+name: Release
+
+# Publishes to PyPI when a version tag is pushed:
+#
+#     git tag v0.1.0 && git push origin v0.1.0
+#
+# Uses PyPI Trusted Publishing, so there is no token to store. The build and the
+# publish are separate jobs so that only the publish job holds the credential.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v10.2.0
+      - name: Check the tag matches the package version
+        run: test "v$(uv version --short)" = "$GITHUB_REF_NAME"
+      - run: uv build
+      - name: Smoke test the wheel
+        run: uvx --from dist/*.whl uv-readiness --help
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/uv-readiness
+    permissions:
+      id-token: write
+    steps:
+      - uses: astral-sh/setup-uv@v10.2.0
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+      - run: uv publish
