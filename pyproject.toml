@@ -7,6 +7,23 @@ license = "MIT"
 authors = [{ name = "Andrii Kohut", email = "kogut.andriy@gmail.com" }]
 requires-python = ">=3.11"
 dependencies = ["packaging>=24.0", "rich>=13.0"]
+keywords = ["uv", "python-version", "dependencies", "wheels", "compatibility"]
+classifiers = [
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
+    "Topic :: Software Development :: Build Tools",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Repository = "https://github.com/andriykohut/uv-readiness"
+Documentation = "https://github.com/andriykohut/uv-readiness/tree/main/docs"
+Issues = "https://github.com/andriykohut/uv-readiness/issues"
 
 [project.scripts]
 uv-readiness = "uv_readiness:main"

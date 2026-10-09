@@ -3,7 +3,7 @@
 Find out whether a uv project can move to a new Python version, and what is in
 the way.
 
-![uv-readiness checking a project for Python 3.13: two packages are blocked, two need an update, and uv explains why](docs/demo.gif)
+![uv-readiness checking a project for Python 3.13: two packages are blocked, two need an update, and uv explains why](https://raw.githubusercontent.com/andriykohut/uv-readiness/main/docs/demo.gif)
 
 ```sh
 uvx uv-readiness 3.14
@@ -77,16 +77,16 @@ It needs `uv` on your PATH whenever it has to ask the resolver.
 - run: uvx uv-readiness 3.14
 ```
 
-The step fails until the project is ready. See [Running in CI](docs/ci.md) for
+The step fails until the project is ready. See [Running in CI](https://github.com/andriykohut/uv-readiness/blob/main/docs/ci.md) for
 a scheduled workflow and for using the JSON output.
 
 ## Documentation
 
-- [How it works](docs/how-it-works.md): what is read, what is run, and where.
-- [Reading the report](docs/report.md): every section, status and note.
-- [JSON output](docs/json.md): the fields behind `--json`.
-- [Running in CI](docs/ci.md): workflows and exit codes.
-- [Limits](docs/limits.md): what the tool cannot tell you.
+- [How it works](https://github.com/andriykohut/uv-readiness/blob/main/docs/how-it-works.md): what is read, what is run, and where.
+- [Reading the report](https://github.com/andriykohut/uv-readiness/blob/main/docs/report.md): every section, status and note.
+- [JSON output](https://github.com/andriykohut/uv-readiness/blob/main/docs/json.md): the fields behind `--json`.
+- [Running in CI](https://github.com/andriykohut/uv-readiness/blob/main/docs/ci.md): workflows and exit codes.
+- [Limits](https://github.com/andriykohut/uv-readiness/blob/main/docs/limits.md): what the tool cannot tell you.
 
 ## Limits worth knowing first
 
@@ -99,7 +99,7 @@ a scheduled workflow and for using the JSON output.
   that spans several Python versions, uv may pick other versions for the older
   ones.
 
-The full list is in [Limits](docs/limits.md).
+The full list is in [Limits](https://github.com/andriykohut/uv-readiness/blob/main/docs/limits.md).
 
 ## Development
 
@@ -113,4 +113,4 @@ vhs docs/demo.tape            # re-record the demo GIF
 
 ## License
 
-MIT. See [LICENSE](LICENSE).
+MIT. See [LICENSE](https://github.com/andriykohut/uv-readiness/blob/main/LICENSE).
