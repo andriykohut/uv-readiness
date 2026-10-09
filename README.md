@@ -64,7 +64,7 @@ It needs `uv` on your PATH whenever it has to ask the resolver.
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: astral-sh/setup-uv@v9
+- uses: astral-sh/setup-uv@v10.2.0
 - run: uvx uv-readiness 3.14
 ```
 

@@ -1,9 +1,11 @@
+import http.client
 import io
 import json
 import re
 import subprocess
 import sys
 import tomllib
+import urllib.request
 from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
@@ -338,6 +340,11 @@ def make_project(root: Path, pyproject: str = PYPROJECT, lock_text: str = LOCK_T
     return root
 
 
+FORKED_LOCK = LOCK_TOML.replace(
+    'requires-python = ">=3.10"\n',
+    'requires-python = ">=3.10"\nresolution-markers = [\n'
+    "    \"python_full_version >= '3.12'\",\n    \"python_full_version < '3.12'\",\n]\n",
+)
 NARROWED_LOCK = LOCK_TOML.replace('requires-python = ">=3.10"', 'requires-python = "==3.13.*"')
 
 
@@ -354,11 +361,13 @@ class FakeRun:
         self.cwd = Path()
         self.pyproject = ""
         self.lock = ""
+        self.env: dict[str, str] = {}
 
     def __call__(
-        self, command: list[str], *, cwd: Path, **_: object
+        self, command: list[str], *, cwd: Path, env: dict[str, str] | None = None, **_: object
     ) -> subprocess.CompletedProcess[str]:
         self.commands.append(command)
+        self.env = env or {}
         self.cwd = Path(cwd)
         self.pyproject = (self.cwd / "pyproject.toml").read_text(encoding="utf-8")
         self.lock = (self.cwd / "uv.lock").read_text(encoding="utf-8")
@@ -367,7 +376,7 @@ class FakeRun:
 
 
 def test_relock_runs_uv_on_a_narrowed_copy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
-    project_dir = make_project(tmp_path)
+    project_dir = make_project(tmp_path, lock_text=FORKED_LOCK)
     run = FakeRun()
     monkeypatch.setattr("uv_readiness.subprocess.run", run)
 
@@ -378,13 +387,35 @@ def test_relock_runs_uv_on_a_narrowed_copy(tmp_path: Path, monkeypatch: pytest.M
         ["uv", "lock", "--project", copy, "--directory", copy, "--python", "3.13", "--upgrade"]
     ]
     assert 'requires-python = "==3.13.*"' in run.pyproject
-    assert 'requires-python = "==3.13.*"' in run.lock
-    assert 'requires-python = ">=3.10"' not in run.lock
     assert result["requires-python"] == "==3.13.*"
     assert run.cwd != project_dir
     assert not run.cwd.exists()
     assert (project_dir / "pyproject.toml").read_text(encoding="utf-8") == PYPROJECT
-    assert (project_dir / "uv.lock").read_text(encoding="utf-8") == LOCK_TOML
+    assert (project_dir / "uv.lock").read_text(encoding="utf-8") == FORKED_LOCK
+
+
+def test_relock_makes_uv_resolve_again(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    run = FakeRun()
+    monkeypatch.setattr("uv_readiness.subprocess.run", run)
+    relock(make_project(tmp_path, lock_text=FORKED_LOCK), PY313)
+    # the copied lock keeps its own Python range, so uv sees it is stale and resolves again,
+    # and loses its fork markers, which belong to that old range
+    assert 'requires-python = ">=3.10"' in run.lock
+    assert "resolution-markers" not in run.lock
+    assert tomllib.loads(run.lock)["package"] == tomllib.loads(LOCK_TOML)["package"]
+
+
+def test_relock_hides_uv_frozen_and_locked_from_uv(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("UV_FROZEN", "1")
+    monkeypatch.setenv("UV_LOCKED", "1")
+    run = FakeRun()
+    monkeypatch.setattr("uv_readiness.subprocess.run", run)
+    relock(make_project(tmp_path), PY313)
+    assert "PATH" in run.env
+    assert "UV_FROZEN" not in run.env
+    assert "UV_LOCKED" not in run.env
 
 
 def test_relock_rejects_a_lock_that_lost_the_project(
@@ -881,6 +912,7 @@ def test_real_uv_is_pinned_to_the_copy_despite_the_environment(
     monkeypatch.setenv("UV_PROJECT", str(project_dir))
     monkeypatch.setenv("UV_WORKING_DIRECTORY", str(project_dir))
     monkeypatch.setenv("UV_PYTHON", "3.12")
+    monkeypatch.setenv("UV_FROZEN", "1")
     code, data = run_json(project_dir, capsys)
     assert code == 1
     assert data["fix_command"] == "uv lock --upgrade-package pyyaml"
@@ -902,6 +934,53 @@ def test_real_uv_capped_project_with_forks_is_not_reported_ready(
     found = {p["name"]: p["status"] for p in data["packages"]}
     assert found["scipy"] == "blocked"
     assert found["idna"] == "ready"
+
+
+def current_project(root: Path, requires_python: str, dependencies: str, cutoff: str) -> Path:
+    """A real project locked as of `cutoff`, with the cutoff in pyproject.toml.
+
+    Unlike `locked_project`, its lock is up to date, so uv has no reason of its own to
+    resolve again when the tool re-locks a copy.
+    """
+    (root / "pyproject.toml").write_text(
+        f'[project]\nname = "probe"\nversion = "0"\nrequires-python = "{requires_python}"\n'
+        f'dependencies = {dependencies}\n\n[tool.uv]\nexclude-newer = "{cutoff}"\n',
+        encoding="utf-8",
+    )
+    subprocess.run(["uv", "lock"], cwd=root, check=True)
+    return root
+
+
+@pytest.mark.network
+@pytest.mark.parametrize(
+    ("requires_python", "dependencies"),
+    [
+        (">=3.11,<3.13", '["pandas", "pyyaml", "requests"]'),
+        (">=3.10,<3.13", '["scipy", "pandas", "pyyaml", "idna", "httpx[http2]"]'),
+    ],
+    ids=["plain", "forked"],
+)
+def test_real_uv_capped_project_that_is_ready_needs_no_updates(
+    requires_python: str, dependencies: str, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project_dir = current_project(tmp_path, requires_python, dependencies, "2025-09-01T00:00:00Z")
+    code, data = run_json(project_dir, capsys)
+    assert data["verdict"] == "ready"
+    assert code == 0
+    assert {p["status"] for p in data["packages"]} == {"ready"}
+    assert "numpy" in {p["name"] for p in data["packages"]}
+    assert data["fix_command"] is None
+
+
+@pytest.mark.network
+def test_real_uv_capped_project_reports_dependencies_new_to_the_target(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    project_dir = current_project(
+        tmp_path, ">=3.11,<3.13", '["discord.py"]', "2025-09-01T00:00:00Z"
+    )
+    _, data = run_json(project_dir, capsys)
+    assert "audioop-lts" in {p["name"] for p in data["packages"]}
 
 
 @pytest.mark.network
@@ -1143,6 +1222,36 @@ def test_main_offline_never_asks_pypi(
     monkeypatch.setattr("uv_readiness.fetch_classifiers", fetch)
     assert main(["3.12", "--project", str(make_project(tmp_path)), "--offline"]) == 0
     assert "Classifiers" not in capsys.readouterr().out
+
+
+def test_fetch_classifiers_reads_one_release(monkeypatch: pytest.MonkeyPatch) -> None:
+    asked: list[str] = []
+
+    def answer(request: urllib.request.Request, timeout: float) -> io.BytesIO:
+        asked.append(request.full_url)
+        return io.BytesIO(json.dumps({"info": {"classifiers": classifiers(12)}}).encode())
+
+    monkeypatch.setattr("uv_readiness.urllib.request.urlopen", answer)
+    assert fetch_classifiers("idna", "3.10") == classifiers(12)
+    assert asked == ["https://pypi.org/pypi/idna/3.10/json"]
+
+
+@pytest.mark.parametrize("body", [b"[]", b'{"info": null}', b'{"info": {"classifiers": 5}}'])
+def test_fetch_classifiers_treats_a_malformed_answer_as_unknown(
+    body: bytes, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr("uv_readiness.urllib.request.urlopen", lambda *_, **__: io.BytesIO(body))
+    assert fetch_classifiers("idna", "3.10") is None
+
+
+def test_fetch_classifiers_treats_a_broken_connection_as_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def broken(*_: object, **__: object) -> io.BytesIO:
+        raise http.client.IncompleteRead(b"")
+
+    monkeypatch.setattr("uv_readiness.urllib.request.urlopen", broken)
+    assert fetch_classifiers("idna", "3.10") is None
 
 
 @pytest.mark.network

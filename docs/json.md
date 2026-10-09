@@ -74,5 +74,5 @@ List version-independent packages that do not declare the target:
 
 ```sh
 uvx uv-readiness 3.14 --json |
-  jq -r '.target as $t | .packages[] | select(.declared and (.declared | index($t) | not)) | .name'
+  jq -r '(.target | rtrimstr("t")) as $t | .packages[] | select(.declared and (.declared | index($t) | not)) | .name'
 ```

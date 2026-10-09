@@ -83,19 +83,23 @@ form when that was enough, `uv lock --upgrade` otherwise.
 The copy holds `pyproject.toml` for the project and each workspace member,
 `uv.lock`, and `uv.toml` if you have one. Before uv runs:
 
-- `requires-python` is set to `==3.M.*` in each `pyproject.toml` and in the
-  copied lock.
+- `requires-python` is set to `==3.M.*` in each `pyproject.toml`. The copied
+  lock keeps its own range, so uv sees it is out of date and resolves again
+  with your locked versions as preferences. The lock's top-level fork markers
+  are removed, because they describe the old range.
 - A project with `dynamic = ["version"]` gets a fixed version, so uv does not
   need your sources to build it.
 - uv is called with `--project`, `--directory` and `--python` pointing at the
   copy and the target, so `UV_PROJECT`, `UV_WORKING_DIRECTORY` or `UV_PYTHON`
-  in your environment cannot redirect it.
+  in your environment cannot redirect it. `UV_FROZEN` and `UV_LOCKED` are not
+  passed on, because they stop uv from resolving.
 
 The copy is deleted afterwards. Your project's files are never written.
 
 ## 5. Classifiers
 
-For ready packages whose evidence is `version-independent`, the tool asks PyPI
+For ready and updated packages whose evidence is `version-independent`, the
+tool asks PyPI
 which Python versions the release declares
 (`https://pypi.org/pypi/<name>/<version>/json`).
 

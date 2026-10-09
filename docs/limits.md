@@ -14,7 +14,7 @@ What `uv-readiness` cannot tell you, and where its answers are approximate.
   counts. A package that has a Linux wheel and no Windows wheel is reported
   ready.
 - **`abi3t` wheels are not recognised.** For a free-threaded target only
-  `cp3Mt` and `py3-none` wheels count.
+  `cp3Mt`, `cp3M-none` and `py3-none` wheels count.
 - **Source-only packages are not judged.** A package with an sdist and no
   wheels is listed separately and does not affect the verdict.
 - **Git, path and editable sources are not checked.**
@@ -48,7 +48,7 @@ What `uv-readiness` cannot tell you, and where its answers are approximate.
   `pyproject.toml` files, `uv.lock` and `uv.toml`, not your sources. The report
   says "resolver pass unavailable" and keeps the lock-only result when:
   - a path dependency is not a workspace member,
-  - metadata other than the version is dynamic,
+  - metadata that uv needs to resolve, such as `dependencies`, is dynamic,
   - `pyproject.toml` has no `requires-python` line.
 
 ## About PyPI lookups

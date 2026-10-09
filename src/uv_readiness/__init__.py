@@ -3,6 +3,7 @@
 import argparse
 import io
 import json
+import os
 import re
 import shutil
 import subprocess
@@ -262,6 +263,7 @@ def classify(lock: Lock, target: Target, original: Lock | None = None) -> list[P
 
 # ponytail: regex edit of requires-python; a project that sets it another way loses the resolver pass
 REQUIRES_PYTHON = re.compile(r"""^(\s*requires-python\s*=\s*)(["']).*?\2""", re.MULTILINE)
+FORK_MARKERS = re.compile(r"^resolution-markers = \[[^\]]*\]\n", re.MULTILINE)
 DYNAMIC = re.compile(r"^(\s*dynamic\s*=\s*\[)([^\]]*)\]", re.MULTILINE)
 VERSION_LINE = re.compile(r"\s+[\w.\-]+\s?(==|>=|<=|>|<)\s?[\w.*+!]+")
 
@@ -315,21 +317,26 @@ def relock(project: Path, target: Target, *args: str) -> Lock:
             (copy / member / "pyproject.toml").write_text(text, encoding="utf-8")
         if not narrowed:
             raise RelockError(f"no requires-python line found in {project / 'pyproject.toml'}")
-        # The lock's own requires-python is pinned too: uv reads the lock's fork markers
-        # against it, and drops every package when they fall outside the new range.
-        lock_text = (project / "uv.lock").read_text(encoding="utf-8")
+        # The copied lock keeps its own Python range, so uv sees it is out of date and resolves
+        # again with the locked versions as preferences. Its top-level fork markers go: they
+        # describe the old range, and uv drops every package when none of them fits the new one.
+        head, mark, packages = (project / "uv.lock").read_text(encoding="utf-8").partition("[[")
         (copy / "uv.lock").write_text(
-            REQUIRES_PYTHON.sub(pin, lock_text, count=1), encoding="utf-8"
+            FORK_MARKERS.sub("", head) + mark + packages, encoding="utf-8"
         )
         if (project / "uv.toml").is_file():
             shutil.copy(project / "uv.toml", copy / "uv.toml")
         # Explicit flags, so UV_PROJECT, UV_WORKING_DIRECTORY or UV_PYTHON in the environment
-        # cannot point uv back at the real project or at another interpreter.
+        # cannot point uv back at the real project or at another interpreter. UV_FROZEN and
+        # UV_LOCKED are withheld: they make `uv lock` leave the copy as it is.
         here = str(copy)
         python = f"3.{target.minor}"
         command = ["uv", "lock", "--project", here, "--directory", here, "--python", python, *args]
+        env = {k: v for k, v in os.environ.items() if k not in ("UV_FROZEN", "UV_LOCKED")}
         try:
-            done = subprocess.run(command, cwd=copy, capture_output=True, text=True, check=False)
+            done = subprocess.run(
+                command, cwd=copy, env=env, capture_output=True, text=True, check=False
+            )
         except FileNotFoundError:
             raise SetupError("uv was not found on PATH") from None
         if done.returncode:
@@ -560,8 +567,8 @@ def fetch_classifiers(name: str, version: str) -> list[str] | None:
     request = urllib.request.Request(url, headers={"User-Agent": "uv-readiness"})
     try:
         with urllib.request.urlopen(request, timeout=10) as response:
-            return json.load(response)["info"]["classifiers"]
-    except (OSError, ValueError, KeyError):
+            return [str(line) for line in json.load(response)["info"]["classifiers"]]
+    except Exception:  # whatever went wrong, the package is "unknown"; the report still prints
         return None
 
 
