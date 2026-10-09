@@ -75,6 +75,11 @@ runs `uv lock` up to three times on the temporary copy:
 3. `uv lock --upgrade --no-build-package <still stuck>`, only to capture uv's
    explanation. Whatever is still stuck is `blocked`.
 
+The upgraded lock is classified again in full. A package that the upgrade
+would leave without a wheel, including a dependency that is new with the
+upgrade, is reported as `blocked`, so the verdict cannot be "ready after
+updates" in that case.
+
 The report prints the command that fixed the most: the `--upgrade-package`
 form when that was enough, `uv lock --upgrade` otherwise.
 

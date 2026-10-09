@@ -44,7 +44,7 @@ An excerpt, with four of the packages and the explanation shortened:
 | `version` | string | The locked version. Absent for a local package without one. |
 | `status` | string | See below. |
 | `required_by` | array of strings | Packages that require it directly. Your project appears by its own name. |
-| `new_version` | string | For `update`: the version uv resolved. Absent otherwise. |
+| `new_version` | string | For `update`: the version uv resolved. Also set on a `blocked` package that the upgrade would move to a release without a wheel. |
 | `evidence` | string | For ready and updated packages: `"target-wheel"` or `"version-independent"`. |
 | `registry` | string | The index the package is locked from. Absent for other sources. |
 | `declared` | array of strings | Python versions the release declares on PyPI. Absent when not looked up. |
@@ -57,7 +57,7 @@ Fields without a value are left out, not set to null.
 |---|---|
 | `ready` | A wheel installs on the target. |
 | `update` | An upgrade gives it a wheel; see `new_version`. |
-| `blocked` | No wheel, and no upgrade fixes it. |
+| `blocked` | No wheel, and no upgrade fixes it; or the upgrade itself would leave it without one. |
 | `no-wheel` | No wheel, and the resolver was not asked or was unavailable. |
 | `source-only` | An sdist and no wheels at all. |
 | `unchecked` | Git, path or other local source. |

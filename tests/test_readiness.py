@@ -682,6 +682,27 @@ def test_an_upgrade_that_costs_another_package_its_wheel_is_not_ready() -> None:
     found = {p.name: (p.status, p.new_version) for p in report.packages}
     assert found["numpy"] == ("update", "2.5.3")
     assert found["pandas"] == ("blocked", "3.0.6")
+    assert {p.name: p.evidence for p in report.packages}["pandas"] is None
+    assert report.verdict == "not ready"
+
+
+def test_an_upgrade_that_adds_a_dependency_without_a_wheel_is_not_ready() -> None:
+    before = lock(
+        project(dep("numpy")),
+        pkg("numpy", "1.26.4", wheels=["numpy-1.26.4-cp312-cp312-win_amd64.whl"]),
+    )
+    after = lock(
+        project(dep("numpy")),
+        pkg(
+            "numpy", "2.5.3", wheels=["numpy-2.5.3-cp313-cp313-win_amd64.whl"], deps=[dep("newdep")]
+        ),
+        pkg("newdep", "1.0", wheels=["newdep-1.0-cp312-cp312-win_amd64.whl"]),
+    )
+    report = analyze(before, PY313, FakeUv(targeted=after))
+    assert [(p.name, p.version, p.status, p.required_by) for p in report.packages] == [
+        ("newdep", "1.0", "blocked", ["numpy"]),
+        ("numpy", "1.26.4", "update", ["app"]),
+    ]
     assert report.verdict == "not ready"
 
 

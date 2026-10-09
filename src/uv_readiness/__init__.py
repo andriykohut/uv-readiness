@@ -464,11 +464,12 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
         if len(stuck(full, still)) < len(still):
             result, command, pulled = full, "uv lock --upgrade", []
             still = stuck(full, still)
-    # an upgrade can move a ready package to a release that has no wheel for the target
+    # An upgrade can leave another package without a wheel for the target: a ready one moved
+    # to a release that has none, or a dependency that is new with the upgrade.
     regressed = [
         n
         for n in stuck(result, sorted(result))
-        if n in current and n not in blockers and all(p.status == "ready" for p in current[n])
+        if n not in blockers and all(p.status == "ready" for p in current.get(n, []))
     ]
 
     for name in blockers:
@@ -482,10 +483,17 @@ def _fix(report: Report, target: Target, original: Lock, relocker: Relocker, ste
                 package.status = "update"
                 package.new_version = _versions(found)
                 package.evidence = found[0].evidence if found else None
-    for name in pulled + regressed:
+    for name in pulled:
         for package in current[name]:
-            package.status = "blocked" if name in regressed else "update"
+            package.status = "update"
             package.new_version = _versions(result[name])
+    for name in regressed:
+        new = [] if name in current else [p for p in result[name] if p.status == "no-wheel"]
+        for package in current.get(name, []):
+            package.new_version = _versions(result[name])
+        for package in current.get(name, new):
+            package.status, package.evidence = "blocked", None
+        report.packages = sorted(report.packages + new, key=lambda p: (p.name, p.version or ""))
     report.fix_command = command
 
     if still:
