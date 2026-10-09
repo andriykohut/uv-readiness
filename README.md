@@ -25,13 +25,22 @@ direct or transitive, and never modifies your project.
   counts those apart from packages with a wheel built for the target, and a
   classifier check lists the ones that do not declare the target yet.
 
-## Why wheels, not classifiers
+## Two signals, used differently
 
-A wheel tagged `cp314` is a fact about a published file: a binary for Python
-3.14 exists. A trove classifier is a line the author has to remember to add,
-and many maintained packages add it months late or never. So wheels decide the
-verdict and the exit code, and classifiers are shown as a hint that never fails
-a run.
+The tool reads both wheels and classifiers. Which one applies depends on the
+package.
+
+| | Wheels | Classifiers |
+|---|---|---|
+| What it is | A published file tagged for a Python version. | A line the author adds to the package metadata. |
+| Which packages | Compiled ones: few in most projects, but the ones that hold up an upgrade. | Everything else: `py3-none` packages, usually the large majority. |
+| How strong | A fact. A `cp314` binary exists or it does not. | A hint. Often added months late, or never. |
+| Effect | Decides the verdict and the exit code. | Shown in the report. Never changes the verdict. |
+
+So for most of your packages the classifier is the only version-specific
+information there is, and the report shows it. It does not fail a run, because a
+missing classifier usually means the author has not updated the metadata, not
+that the package is broken.
 
 This is the uv counterpart to
 [pdm-readiness](https://github.com/andriykohut/pdm-readiness), which reads
